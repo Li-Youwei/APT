@@ -1,8 +1,9 @@
 import copy
 import glob
+import json
 import os
 import threading
-from typing import Union
+from typing import Dict, List, Union
 
 import cv2
 import numpy as np
@@ -31,16 +32,24 @@ def parse_config(ckpt_dir: str):
     model_name = cfg.model
     vlm_finetune_mode = getattr(cfg, "vlm_finetune_mode", "frozen")
 
+    # Build the model with the stage the checkpoint was trained in. Config
+    # files written before `train_stage` was dumped keep the old behaviour
+    # (inference always used train_stage=1).
+    with open(config_file, "r", encoding="utf-8") as fp:
+        raw_items = json.load(fp)
+    train_stage = int(raw_items["train_stage"]) if "train_stage" in raw_items else 1
+
     data_config.shuffle_cameras = False  # overwrite
     print("[INFO] model = {}".format(model_name))
     print("[INFO] data config = {}".format(data_config))
     print("[INFO] vlm_finetune_mode = {}".format(vlm_finetune_mode))
+    print("[INFO] train_stage = {}".format(train_stage))
 
-    return model_name, data_config, vlm_finetune_mode
+    return model_name, data_config, vlm_finetune_mode, train_stage
 
 
 def load_model(path, device, use_ema: bool = False):
-    model_name, data_config, vlm_finetune_mode = parse_config(os.path.dirname(path))
+    model_name, data_config, vlm_finetune_mode, train_stage = parse_config(os.path.dirname(path))
 
     # Load to CPU first so optimizer/scheduler states (can be >15 GB after
     # all-rank ZeRO gathering) never touch GPU memory.  Only model weights
@@ -56,7 +65,7 @@ def load_model(path, device, use_ema: bool = False):
     #     loading we merge and the result is effectively frozen.
     infer_vlm_mode = "lora" if vlm_finetune_mode == "lora" else "frozen"
     model: vla.VLA = getattr(vla, "vla_{}".format(model_name))(
-        train_stage=1, vlm_finetune_mode=infer_vlm_mode).to(device)
+        train_stage=train_stage, vlm_finetune_mode=infer_vlm_mode).to(device)
     model.actor.load_state_dict(ckpt["weights"], strict=True)
 
     if "vlm_weights" in ckpt:
@@ -76,7 +85,36 @@ def load_model(path, device, use_ema: bool = False):
     print("[INFO] Load weights from iter: {}".format(ckpt["current_iters"]))
     model.eval()
     save_gate_img(model)
+    model.r1_meta = dict(  # read by TrajPlanner.get_meta / load_weights
+        ckpt_path=os.path.abspath(path),
+        current_iters=int(ckpt["current_iters"]),
+        model_name=model_name,
+        vlm_finetune_mode=vlm_finetune_mode,
+        train_stage=train_stage,
+    )
     return model, data_config
+
+
+def _repeat_batch(obj, K: int, skip_keys=("deepstack_visual_embeds",)):
+    """Repeat every batch-1 tensor in a (nested) VLM input/output dict K times.
+
+    `deepstack_visual_embeds` is flattened over the batch (S, C) and is not
+    read by the action expert, so it is left untouched.
+    """
+    if isinstance(obj, Tensor):
+        if obj.dim() > 0 and obj.shape[0] == 1:
+            return obj.repeat(K, *([1] * (obj.dim() - 1)))
+        return obj
+    if isinstance(obj, dict):
+        return {k: (v if k in skip_keys else _repeat_batch(v, K, skip_keys))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        if len(obj) == 1 and isinstance(obj[0], str):
+            return obj * K
+        return [_repeat_batch(v, K, skip_keys) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_repeat_batch(v, K, skip_keys) for v in obj)
+    return obj
 
 
 def save_gate_img(model: vla.VLA):
@@ -111,6 +149,7 @@ class TrajPlanner(object):
         
         self.device = device
         self.last_obs_data = None
+        self.sample_lock = threading.Lock()
     
     def reset(self):
         with self.ensembler_lock:
@@ -379,4 +418,165 @@ class TrajPlanner(object):
                 )
         
         return future_ee_poses, future_grippers
+
+    # ------------------------------------------------------------------
+    # R1 (VA + selector) additions. Stateless: the caller passes the frame,
+    # the prompt and the initial noise, so several clients can share one
+    # server and results depend only on (weights, frame, prompt, noise).
+    # ------------------------------------------------------------------
+    def get_meta(self) -> dict:
+        meta = dict(getattr(self.model, "r1_meta", {}))
+        meta["ta"] = int(self.config.num_future_states)
+        meta["nee"] = len(self.config.ee_indices)
+        meta["act_dim"] = int(self.model.actor.act_dim)
+        return meta
+
+    def load_weights(self, ckpt_path: str) -> dict:
+        """Hot-swap actor (and VLM, if stored) weights from another checkpoint
+        of the same architecture. Strict for the actor."""
+        model_name, _data_config, vlm_mode, train_stage = parse_config(os.path.dirname(ckpt_path))
+        meta = self.model.r1_meta
+        assert (model_name, train_stage) == (meta["model_name"], meta["train_stage"]), \
+            "checkpoint {} is ({}, stage {}), server holds ({}, stage {})".format(
+                ckpt_path, model_name, train_stage, meta["model_name"], meta["train_stage"])
+        assert vlm_mode == "frozen" and meta["vlm_finetune_mode"] == "frozen", \
+            "load_weights only supports frozen-VLM checkpoints"
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        assert "vlm_weights" not in ckpt, "frozen-VLM checkpoint should not carry vlm_weights"
+        with self.sample_lock:
+            self.model.actor.load_state_dict(ckpt["weights"], strict=True)
+            self.model.eval()
+        meta.update(ckpt_path=os.path.abspath(ckpt_path),
+                    current_iters=int(ckpt["current_iters"]))
+        print("[INFO] Hot-swapped weights from {} (iter {})".format(ckpt_path, meta["current_iters"]))
+        return self.get_meta()
+
+    def _frames_to_batch1(self, obs_frames: List[dict], prompt_text: str, config: DataConfig):
+        (
+            obs_rgbs, obs_masks, obs_cam_poses, obs_ee_poses, action_ref_pose,
+            history_actions, future_actions, current_time, K, valid_ee_mask
+        ) = DataSampler.sample_framedict(
+            obs_traj=obs_frames,
+            ee_indices=config.ee_indices,
+            camera_names=config.camera_names,
+            ee_ref_cams=config.ee_ref_cams,
+            num_history_cameras=config.num_history_cameras,
+            num_history_states=config.num_history_states,
+            num_future_states=config.num_future_states,
+            latest=True,
+            sample_camera_gaps=config.sample_camera_gaps,
+            sample_state_gaps=config.sample_state_gaps,
+            sample_dt=config.sample_dt,
+            record_dt=config.record_dt,
+            output_image_hw=config.output_image_hw,
+            enable_seg=config.enable_seg,
+        )
+        T = obs_rgbs.shape[0]
+        H, W = obs_rgbs.shape[-2:]
+        norm_xys = gen_norm_xy_map(H, W, K).astype(np.float32)[None].repeat(T, axis=0)
+        obs_data = {
+            "obs_rgbs": obs_rgbs,
+            "obs_masks": obs_masks,
+            "obs_norm_xys": norm_xys,
+            "obs_extrinsics": obs_cam_poses,
+            "current_ee_pose": obs_ee_poses[-1],
+            "action_ref_pose": action_ref_pose,
+            "history_ee_states": history_actions,
+            "gt_future_ee_states": future_actions,
+            "valid_ee_mask": valid_ee_mask,
+        }
+        out = {}
+        for k, v in obs_data.items():
+            out[k] = None if v is None else torch.from_numpy(np.asarray(v)).to(self.device).unsqueeze(0)
+        out["prompt_text"] = [prompt_text]
+        return out
+
+    def sample_trajs(
+        self,
+        obs_frames: Union[dict, List[dict]],
+        prompt_text: str,
+        noise: np.ndarray,
+        config: Union[str, dict, DataConfig, None] = None,
+        share_vlm: bool = True,
+    ) -> Dict[str, np.ndarray]:
+        """Draw K trajectories for one observation, one per row of `noise`.
+
+        Args:
+            obs_frames: one frame dict (see `add_obs_frame`) or a list of them
+                (oldest first); only the frames the data config needs are used.
+            prompt_text: instruction. Stage-0 (VA) models mask it internally.
+            noise: (K, Nee, Ta, act_dim) float32 initial DDIM noise.
+            config: data config (name in DATA_CONFIGS, dict or DataConfig);
+                None uses the server's current one.
+            share_vlm: True runs the VLM once on a batch of 1 and repeats its
+                outputs K times; False replicates the observation K times
+                (the previous `sample_num` behaviour) for equivalence checks.
+
+        Returns dict with numpy arrays, for the *first* selected end-effector
+        of the config (`ee_indices[0]`):
+            ee_pose (K, Ta, 4, 4) world-frame, gripper (K, Ta) in [0, 1],
+            plus `infer_time_s` (float).
+        """
+        import time as _time
+        if isinstance(obs_frames, dict):
+            obs_frames = [obs_frames]
+        if config is None:
+            cfg = self.config
+        elif isinstance(config, str):
+            cfg = copy.deepcopy(DATA_CONFIGS[config])
+        elif isinstance(config, dict):
+            cfg = DataConfig(**config)
+        else:
+            cfg = copy.deepcopy(config)
+        cfg.shuffle_cameras = False
+
+        noise_t = torch.from_numpy(np.ascontiguousarray(noise, dtype=np.float32)).to(self.device)
+        Kn = noise_t.shape[0]
+
+        with self.sample_lock:
+            t0 = _time.perf_counter()
+            data = self._frames_to_batch1(obs_frames, prompt_text, cfg)
+            exp_shape = (Kn, data["gt_future_ee_states"].shape[2],
+                         data["gt_future_ee_states"].shape[1], self.model.actor.act_dim)
+            assert tuple(noise_t.shape) == exp_shape, \
+                "noise shape {} != expected {}".format(tuple(noise_t.shape), exp_shape)
+
+            with torch.inference_mode():
+                if share_vlm:
+                    vl_inputs, vl_outputs = self.model.vlm(
+                        obs_rgbs=data["obs_rgbs"], obs_masks=data["obs_masks"],
+                        obs_norm_xys=data["obs_norm_xys"], obs_extrinsics=data["obs_extrinsics"],
+                        prompt_text=data["prompt_text"], fp16=True)
+                    vl_inputs = _repeat_batch(vl_inputs, Kn)
+                    vl_outputs = _repeat_batch(vl_outputs, Kn)
+                    rep = _repeat_batch(data, Kn)
+                else:
+                    rep = _repeat_batch(data, Kn)
+                    vl_inputs, vl_outputs = self.model.vlm(
+                        obs_rgbs=rep["obs_rgbs"], obs_masks=rep["obs_masks"],
+                        obs_norm_xys=rep["obs_norm_xys"], obs_extrinsics=rep["obs_extrinsics"],
+                        prompt_text=rep["prompt_text"], fp16=True)
+                actions: Tensor = self.model.actor(
+                    vl_inputs=vl_inputs,
+                    vl_outputs=vl_outputs,
+                    current_ee_pose=rep["current_ee_pose"],
+                    action_ref_pose=rep["action_ref_pose"],
+                    history_ee_states=rep["history_ee_states"],
+                    gt_future_ee_states=rep["gt_future_ee_states"],
+                    valid_ee_mask=rep["valid_ee_mask"],
+                    inference=True,
+                    fp16=True,
+                    initial_noise=noise_t,
+                )  # (K, Ta, nee_sel, 17)
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize(self.device)
+            infer_time = _time.perf_counter() - t0
+
+        actions = actions.float().cpu().numpy()[:, :, 0]  # first selected ee
+        Kk, Ta = actions.shape[:2]
+        return {
+            "ee_pose": actions[..., :16].reshape(Kk, Ta, 4, 4).astype(np.float32),
+            "gripper": actions[..., 16].astype(np.float32),
+            "infer_time_s": float(infer_time),
+        }
 

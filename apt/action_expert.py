@@ -621,6 +621,7 @@ class ActionExpert(nn.Module):
         fp16: bool,
         robot_pose_aug: bool = False,
         camera_drop_prob: Optional[Tensor] = None,
+        initial_noise: Optional[Tensor] = None,
     ):
         """
         Args:
@@ -657,6 +658,9 @@ class ActionExpert(nn.Module):
             valid_ee_mask: (B, Nee), only compute loss on these end-effectors
             inference: if True, returns the predicted trajectory, otherwise returns loss and metrics for logging
             fp16: if True, use bfloat16
+            initial_noise: (B, Nee, Ta, act_dim) or None. Inference only: the
+                starting noise of the DDIM chain. None keeps the previous
+                behaviour (drawn with torch.randn on the default generator).
         
         Returns
         -------
@@ -777,7 +781,8 @@ class ActionExpert(nn.Module):
         if inference:
             pred_actions = self.iterative_denoise(
                 traj_shape=(B, Nee, Ta, self.act_dim),
-                fixed_inputs=fixed_inputs
+                fixed_inputs=fixed_inputs,
+                initial_noise=initial_noise,
             )  # (B, Nee, Ta, act_dim)
             pred_future_ee_states = action2states(
                 action_ref_pose,    # (B, Nee, 4, 4)

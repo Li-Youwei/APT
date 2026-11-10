@@ -58,6 +58,8 @@ class TrainConfig(object):
 
     robot_pose_aug: bool = False  # if True, add noise to the robot states
     camera_view_dropout: float = 0.0  # probability of dropping one camera view during training
+
+    seed: int | None = None  # None = unseeded (old behaviour); else torch/numpy/random seeded with seed + rank
     
     def __post_init__(self):
         for i, D in enumerate(self.dataset_classes):
@@ -186,4 +188,28 @@ CONFIGS["finetune_aloha_pp_clutter"] = TrainConfig(
     num_warmup=int(2e3),
     save_interval=int(10e3),
     max_iterations=int(70e3),
+)
+
+# R1 (exp/R1_va_jev_libero/spec.md, section 2.1): Stage-0 VA fine-tuned on the
+# four LIBERO suites, initialised from HF `KechunXu1/apt_models/apt_va` via
+# --pretrained_ckpt (no layer mapping). 2 GPUs x bs 32 under DDP.
+CONFIGS["r1_va_libero4"] = TrainConfig(
+    train_stage=0,
+    model="base",
+    vlm_finetune_mode="frozen",
+    dataset_classes=[datasets.LiberoSpatial, datasets.LiberoObject, datasets.LiberoGoal, datasets.Libero10],
+    dataset_weights=[1, 1, 1, 1],
+    sample_multiplex=1000,
+    bs=32,
+    gradient_accumulation_steps=1,
+    max_lr=1e-4,
+    wd=1e-2,
+    num_warmup=int(2e3),
+    max_iterations=int(40e3),
+    save_interval=int(10e3),
+    fp16=True,
+    ema_enabled=False,
+    camera_view_dropout=0.0,
+    robot_pose_aug=False,
+    seed=0,
 )

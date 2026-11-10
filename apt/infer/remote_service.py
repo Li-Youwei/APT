@@ -67,6 +67,19 @@ class Service(TrajPlanner):
     def ensemble_traj(self, future_ee_poses, future_grippers, future_time):
         return super().ensemble_traj(future_ee_poses, future_grippers, future_time)
 
+    # R1 additions (stateless K-sample API, see TrajPlanner.sample_trajs)
+    @expose()
+    def sample_trajs(self, obs_frames, prompt_text, noise, config=None, share_vlm=True):
+        return super().sample_trajs(obs_frames, prompt_text, noise, config, share_vlm)
+
+    @expose()
+    def load_weights(self, ckpt_path):
+        return super().load_weights(ckpt_path)
+
+    @expose()
+    def get_meta(self):
+        return super().get_meta()
+
 
 def run_service():
     import logging

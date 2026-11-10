@@ -23,8 +23,11 @@ back-end-specific decision lives in a ``_Backend`` strategy subclass under
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import random
 import sys
+import time
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -112,6 +115,14 @@ class AverageMeter:
 
     def avg(self):
         return self.sum / self.count if self.count else 0.0
+
+
+def seed_everything(seed: int):
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def count_trainable(m: torch.nn.Module):
@@ -215,6 +226,9 @@ class Trainer:
             if self.is_dist else "cuda:0"
 
         maybe_bind_cpu_affinity(self.local_rank, self.cfg)
+
+        if self.cfg.seed is not None:
+            seed_everything(self.cfg.seed + self.rank)
 
         if is_main_process():
             print(f"[INFO] Back-end: {self.backend}")
@@ -470,6 +484,7 @@ class Trainer:
         """Run the unified training loop. Back-end-specific behaviour is
         delegated entirely to ``self.bk``."""
         averages: Dict[str, AverageMeter] = {}
+        self._fit_start_time = time.time()
         self.engine.train()
         accum = max(1, self.cfg.gradient_accumulation_steps)
         micro = 0
@@ -539,6 +554,7 @@ class Trainer:
 
         if (self.cfg.save_interval > 0
                 and self.current_iters % self.cfg.save_interval == 0):
+            self._log_resources()
             avg_m = {k: v.avg() for k, v in averages.items()}
             red_m = reduce_metrics(avg_m, is_dist=self.is_dist)
             latest = red_m.get("total_loss", avg_m.get("total_loss", 0.0))
@@ -552,6 +568,26 @@ class Trainer:
             self.log_metrics(red_log)
             for m in averages.values():
                 m.reset()
+
+
+    def _log_resources(self):
+        """Per-rank wall clock (since `fitting` started) and peak CUDA memory,
+        appended to <log_dir>/<save>/resource_rank<r>.jsonl. Every rank writes
+        its own file, so no collective is needed."""
+        if not self.save:
+            return
+        rec = {
+            "iter": self.current_iters,
+            "rank": self.rank,
+            "wall_clock_s": time.time() - getattr(self, "_fit_start_time", time.time()),
+            "max_memory_allocated_gb": torch.cuda.max_memory_allocated(self.model_device) / 1024 ** 3,
+            "max_memory_reserved_gb": torch.cuda.max_memory_reserved(self.model_device) / 1024 ** 3,
+        }
+        log_dir = os.path.join(self.LOG_DIR, self.save)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, f"resource_rank{self.rank}.jsonl"), "a") as fp:
+            fp.write(json.dumps(rec) + "\n")
+        print(f"[INFO] resource: {rec}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
