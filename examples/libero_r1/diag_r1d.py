@@ -28,13 +28,13 @@ from shm_transport import setup_log_level
 from . import libero_common as LC
 from . import traj_select as TS
 from .draw import draw_r1d_figure
-from .policy_client import Policy, noise_streams
+from .policy_client import Policy, draw_ref_cam, noise_streams, ref_cam_streams
 
 N_SAMPLES = 64
 FIELDS = ["suite", "task_id", "state_id", "ckpt_iter", "instruction",
           "n_clusters_004", "n_clusters_008", "n_clusters_012", "cluster_sizes_008",
           "covered", "min_dist_to_vla", "vla_cluster_rank", "vla_cluster_share",
-          "seed", "ckpt_path"]
+          "seed", "ckpt_path", "va_ref_cam", "vla_ref_cam"]
 
 
 def diag_seed(suite: str, task_id: int, state_id: int) -> int:
@@ -80,6 +80,8 @@ def main(args):
                     for state_id in todo:
                         seed = diag_seed(suite_name, task_id, state_id)
                         va_rng, vla_rng = noise_streams(seed)
+                        va_cam_rng, vla_cam_rng = ref_cam_streams(seed)
+                        va_cam, vla_cam = draw_ref_cam(va_cam_rng), draw_ref_cam(vla_cam_rng)
                         obs = LC.reset_to_state(env, init_states[state_id])
                         frame = LC.obs_libero2apt(obs, time=0, env=env)
 
@@ -87,16 +89,18 @@ def main(args):
                         if os.path.exists(ref_file):
                             z = np.load(ref_file)
                             ref_pos, ref_grip = z["pos"], z["grip"]
+                            assert str(z["ref_cam"]) == vla_cam, f"stale VLA reference cache {ref_file}"
                         else:
-                            r = vla.sample(frame, instruction, vla.noise(vla_rng, 1))
+                            r = vla.sample(frame, instruction, vla.noise(vla_rng, 1), vla_cam)
                             ref_pos, ref_grip = r["pos"][0], r["grip"][0]
-                            np.savez(ref_file, pos=ref_pos, grip=ref_grip, seed=seed,
+                            np.savez(ref_file, pos=ref_pos, grip=ref_grip, seed=seed, ref_cam=vla_cam,
                                      vla_ckpt=str(vla.meta.get("ckpt_path")))
 
-                        out = va.sample(frame, instruction, va.noise(va_rng, N_SAMPLES))
+                        out = va.sample(frame, instruction, va.noise(va_rng, N_SAMPLES), va_cam)
                         stats, cand = TS.r1d_analyse(out["pos"], out["grip"], ref_pos, ref_grip)
                         row = dict(suite=suite_name, task_id=task_id, state_id=state_id, ckpt_iter=it,
-                                   instruction=instruction, seed=seed, ckpt_path=ckpt, **stats)
+                                   instruction=instruction, seed=seed, ckpt_path=ckpt,
+                                   va_ref_cam=va_cam, vla_ref_cam=vla_cam, **stats)
                         with open(csv_path, "a", newline="") as fp:
                             csv.DictWriter(fp, fieldnames=FIELDS).writerow(row)
                         done.add((suite_name, task_id, state_id, it))

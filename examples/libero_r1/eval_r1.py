@@ -30,7 +30,7 @@ from shm_transport import setup_log_level
 from . import libero_common as LC
 from . import traj_select as TS
 from .draw import VideoWriter, video_frame
-from .policy_client import Policy, noise_streams
+from .policy_client import Policy, draw_ref_cam, noise_streams, ref_cam_streams
 
 EP_FIELDS = ["suite", "task_id", "episode_id", "instruction", "arm", "success", "steps",
              "n_queries", "n_decisions", "wall_time_s", "seed"]
@@ -129,10 +129,11 @@ def _cams(env):
 
 def run_episode_vla(env, obs, instruction, vla: Policy, seed, max_steps, vid, killer):
     _va_rng, vla_rng = noise_streams(seed)
+    _va_cam_rng, vla_cam_rng = ref_cam_streams(seed)
     t, q, done = 0, 0, False
     while not done and t < max_steps:
         frame = LC.obs_libero2apt(obs, time=t, env=env)
-        out = vla.sample(frame, instruction, vla.noise(vla_rng, 1))
+        out = vla.sample(frame, instruction, vla.noise(vla_rng, 1), draw_ref_cam(vla_cam_rng))
         killer.tick()
         poses, grip = out["poses"][0], out["grip"][0]
         q += 1
@@ -151,19 +152,20 @@ def run_episode_vla(env, obs, instruction, vla: Policy, seed, max_steps, vid, ki
 def run_episode_va(env, obs, instruction, selector: TS.Selector, va: Policy, vla, seed, max_steps,
                    vid, killer, ids):
     va_rng, vla_rng = noise_streams(seed)
+    va_cam_rng, vla_cam_rng = ref_cam_streams(seed)
     t, q, n_dec, done = 0, 0, 0, False
     prev_sel_pos = None
     lines = []
     while not done and t < max_steps:
         frame = LC.obs_libero2apt(obs, time=t, env=env)
-        out = va.sample(frame, instruction, va.noise(va_rng, TS.K_SAMPLES))
+        out = va.sample(frame, instruction, va.noise(va_rng, TS.K_SAMPLES), draw_ref_cam(va_cam_rng))
         killer.tick()
         pos, grip, poses = out["pos"], out["grip"], out["poses"]
         cand = TS.make_candidates(pos, grip)
         ctx = TS.SelectionContext(cand=cand, pos=pos, grip=grip, instruction=instruction)
         vla_out = None
         if selector.needs_vla_ref:
-            vla_out = vla.sample(frame, instruction, vla.noise(vla_rng, 1))
+            vla_out = vla.sample(frame, instruction, vla.noise(vla_rng, 1), draw_ref_cam(vla_cam_rng))
             ctx.ref_pos, ctx.ref_grip = vla_out["pos"][0], vla_out["grip"][0]
         sel = selector.select(ctx)
         if len(cand.candidates) >= 2:
@@ -177,11 +179,12 @@ def run_episode_va(env, obs, instruction, selector: TS.Selector, va: Policy, vla
                                      gripper=r4(grip[c.center])) for c in cand.candidates],
                     selected_candidate=sel.candidate_idx, selected_sample_idx=k,
                     dist_selected_to_prev=TS.dist_selected_to_prev(prev_sel_pos, sel_pos),
-                    sampling_time_s=out["rpc_time_s"], va_infer_time_s=out["infer_time_s"])
+                    sampling_time_s=out["rpc_time_s"], va_infer_time_s=out["infer_time_s"],
+                    va_ref_cam=out["ref_cam"])
         if k not in [c.center for c in cand.candidates]:
             line.update(executed_pos=r4(pos[k]), executed_gripper=r4(grip[k]))
         if vla_out is not None:
-            line.update(vla_time_s=vla_out["rpc_time_s"], vla_ref_pos=r4(ctx.ref_pos),
+            line.update(vla_time_s=vla_out["rpc_time_s"], vla_ref_cam=vla_out["ref_cam"], vla_ref_pos=r4(ctx.ref_pos),
                         vla_ref_gripper=r4(ctx.ref_grip))
         line.update(sel.info)
         lines.append(line)

@@ -13,6 +13,11 @@ import numpy as np
 from shm_transport import get_shm_proxy
 
 DATA_CONFIG = "Libero"
+# Candidate action-reference cameras of the Libero data config
+# (data_utils/datasets.py: ee_ref_cams={0: ("agentview", "eye_in_hand")}).
+# Training draws one uniformly per sample; we keep that distribution but draw
+# it from the episode's seeded stream instead of the server's unseeded `random`.
+REF_CAMS = ("agentview", "eye_in_hand")
 
 
 def noise_streams(seed: int):
@@ -20,6 +25,18 @@ def noise_streams(seed: int):
     (VA stream, VLA stream). Same seed -> same noise, whatever the arm."""
     va_ss, vla_ss = np.random.SeedSequence(int(seed)).spawn(2)
     return np.random.default_rng(va_ss), np.random.default_rng(vla_ss)
+
+
+def ref_cam_streams(seed: int):
+    """Two more independent generators from the same seed, for the per-query
+    reference-camera draw: (VA, VLA). SeedSequence children are keyed by index,
+    so children 0-1 (the noise streams above) are unchanged."""
+    _a, _b, va_ss, vla_ss = np.random.SeedSequence(int(seed)).spawn(4)
+    return np.random.default_rng(va_ss), np.random.default_rng(vla_ss)
+
+
+def draw_ref_cam(rng: np.random.Generator) -> str:
+    return REF_CAMS[int(rng.integers(len(REF_CAMS)))]
 
 
 class Policy:
@@ -40,9 +57,11 @@ class Policy:
         shape = (K, self.meta["nee"], self.meta["ta"], self.meta["act_dim"])
         return rng.standard_normal(shape).astype(np.float32)
 
-    def sample(self, frame: dict, prompt: str, noise: np.ndarray, share_vlm: bool = True) -> dict:
+    def sample(self, frame: dict, prompt: str, noise: np.ndarray, ref_cam: str, share_vlm: bool = True) -> dict:
+        assert ref_cam in REF_CAMS, ref_cam
         t0 = time.perf_counter()
-        out = self.proxy.sample_trajs(frame, prompt, noise, DATA_CONFIG, bool(share_vlm))
+        out = self.proxy.sample_trajs(frame, prompt, noise, DATA_CONFIG, bool(share_vlm), ref_cam)
+        assert out.get("ref_cam") == ref_cam, "server ignored ref_cam (old server code still running?)"
         rpc_time = time.perf_counter() - t0
         poses = np.asarray(out["ee_pose"], np.float64)  # (K, T, 4, 4)
         return {
@@ -51,4 +70,5 @@ class Policy:
             "grip": np.asarray(out["gripper"], np.float64),  # (K, T)
             "infer_time_s": float(out["infer_time_s"]),
             "rpc_time_s": rpc_time,
+            "ref_cam": ref_cam,
         }

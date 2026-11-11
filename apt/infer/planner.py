@@ -498,6 +498,7 @@ class TrajPlanner(object):
         noise: np.ndarray,
         config: Union[str, dict, DataConfig, None] = None,
         share_vlm: bool = True,
+        ref_cam: Union[str, None] = None,
     ) -> Dict[str, np.ndarray]:
         """Draw K trajectories for one observation, one per row of `noise`.
 
@@ -511,6 +512,13 @@ class TrajPlanner(object):
             share_vlm: True runs the VLM once on a batch of 1 and repeats its
                 outputs K times; False replicates the observation K times
                 (the previous `sample_num` behaviour) for equivalence checks.
+            ref_cam: camera whose frame the action is expressed in. The data
+                config lists several candidates (Libero: agentview,
+                eye_in_hand) and `DataSampler` otherwise picks one with the
+                unseeded `random` module on every call, so the same noise
+                gives different trajectories. Pass it explicitly (drawn from
+                the caller's seeded RNG) for reproducible sampling; None keeps
+                the old random pick.
 
         Returns dict with numpy arrays, for the *first* selected end-effector
         of the config (`ee_indices[0]`):
@@ -529,6 +537,12 @@ class TrajPlanner(object):
         else:
             cfg = copy.deepcopy(config)
         cfg.shuffle_cameras = False
+        if ref_cam is not None:
+            for ee in cfg.ee_indices:
+                cands = cfg.ee_ref_cams[ee]
+                cands = (cands,) if isinstance(cands, str) else tuple(cands)
+                assert ref_cam in cands, "ref_cam {!r} not in {} for ee {}".format(ref_cam, cands, ee)
+            cfg.ee_ref_cams = {ee: ref_cam for ee in cfg.ee_indices}
 
         noise_t = torch.from_numpy(np.ascontiguousarray(noise, dtype=np.float32)).to(self.device)
         Kn = noise_t.shape[0]
@@ -578,5 +592,6 @@ class TrajPlanner(object):
             "ee_pose": actions[..., :16].reshape(Kk, Ta, 4, 4).astype(np.float32),
             "gripper": actions[..., 16].astype(np.float32),
             "infer_time_s": float(infer_time),
+            "ref_cam": ref_cam,
         }
 

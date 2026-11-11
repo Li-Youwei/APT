@@ -53,7 +53,9 @@ pyro4-ns -p 9091 &
 CUDA_VISIBLE_DEVICES=1 python -m apt.infer.remote_service --ckpt checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt --uri vla --ns_port 9091 --ensemble 0 &
 CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt checkpoints/APT/va_libero4_r1/ckpt_0040000.pt --uri va --ns_port 9091 --ensemble 0 &
 ```
-VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_sampling --uri va` —— [1][2] 必须 PASS；[3] 的数值写入结果包（共享 VLM 与复制观测的差异）。
+VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_sampling --uri va` —— 两个参考相机（agentview、eye_in_hand）各自的 [1][2] 必须 PASS；[3] 的数值写入结果包（共享 VLM 与复制观测的差异）；[4] 只是诊断输出（同一噪声在两个参考相机下的差异，预期很大）。
+
+> 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
 ## 5. 按第 6 节顺序执行
 1. D 臂冒烟（冒烟 5，≥5/6）：

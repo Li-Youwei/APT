@@ -69,8 +69,8 @@ class Service(TrajPlanner):
 
     # R1 additions (stateless K-sample API, see TrajPlanner.sample_trajs)
     @expose()
-    def sample_trajs(self, obs_frames, prompt_text, noise, config=None, share_vlm=True):
-        return super().sample_trajs(obs_frames, prompt_text, noise, config, share_vlm)
+    def sample_trajs(self, obs_frames, prompt_text, noise, config=None, share_vlm=True, ref_cam=None):
+        return super().sample_trajs(obs_frames, prompt_text, noise, config, share_vlm, ref_cam)
 
     @expose()
     def load_weights(self, ckpt_path):
