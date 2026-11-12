@@ -23,8 +23,11 @@ Per sample and model:
                training (ActionExpert training branch, fp16 autocast).
 Ground-truth statistics (adjacent-step displacement median / p95 / max, net
 displacement) are model independent.
-Outputs: x2_gt.csv, x2_pred.csv, x2_loss.csv, x2_summary.json; smoke check 3:
-VLA mean position error <= 3 cm.
+Outputs: x2_gt.csv, x2_pred.csv, x2_loss.csv, x2_summary.json. Smoke check 3
+(spec section 11): VLA median position error <= 4 cm and net-displacement ratio
+pred/gt in 0.7-1.4. Spec 11.3 extra records (X2 and X2b): position error at
+future steps 1, 2, 4, 8, 16, 32 and gripper |pred - gt| on the trajectory with the
+smallest mean position error (VA: best of 8), plus mean gt / pred gripper openness.
 
 X2b (spec section 10, ruling 4) -- inference-setting control on the SAME cached
 samples and noise seeds, only for the VA models passed in --models:
@@ -151,6 +154,55 @@ def gt_pos(rec):
     return rec["gt_future_ee_states"][:, 0, :16].reshape(-1, 4, 4)[:, :3, 3].double().numpy()
 
 
+def gt_grip(rec):
+    return rec["gt_future_ee_states"][:, 0, 16].double().numpy()
+
+
+def cur_pos(rec):
+    return rec["current_ee_pose"][0, :3, 3].double().numpy()
+
+
+STEP_IDS = (1, 2, 4, 8, 16, 32)  # spec 11.3, 1-based future steps
+
+
+def sample_record(ppos, pgrip, rec):
+    """Per-sample comparison of Kp predictions with the ground truth (spec 9.2, 11.3).
+    The 'best' trajectory is the one with the smallest 32-step mean position error
+    (for the VLA, Kp = 1, it is the only one); step errors and gripper errors are
+    taken on it. Net displacements are measured from the current EE position for
+    both prediction and ground truth."""
+    gt, gg, cur = gt_pos(rec), gt_grip(rec), cur_pos(rec)
+    step_err = np.linalg.norm(ppos - gt[None], axis=-1)        # (Kp, Ta)
+    e = step_err.mean(axis=1)                                 # (Kp,)
+    b = int(np.argmin(e))
+    pred_net = np.linalg.norm(ppos[:, -1] - cur[None], axis=-1)
+    rec_out = dict(err_min=float(e.min()), err_mean=float(e.mean()),
+                   pred_net_from_cur_median=float(np.median(pred_net)),
+                   gt_net_from_cur=float(np.linalg.norm(gt[-1] - cur)),
+                   grip_mae_best=float(np.abs(pgrip[b] - gg).mean()),
+                   grip_gt_mean=float(gg.mean()), grip_pred_mean_best=float(pgrip[b].mean()))
+    for k in STEP_IDS:
+        rec_out[f"err_step{k}_best"] = float(step_err[b, k - 1])
+    return rec_out
+
+
+EXTRA_FIELDS = (["pred_net_from_cur_median", "gt_net_from_cur", "grip_mae_best", "grip_gt_mean",
+                 "grip_pred_mean_best"] + [f"err_step{k}_best" for k in STEP_IDS])
+
+
+def extra_summary(rows):
+    """Spec 11.3 aggregates over samples."""
+    out = {f"err_step{k}_median": float(np.median([r[f"err_step{k}_best"] for r in rows])) for k in STEP_IDS}
+    out.update(grip_mae_median=float(np.median([r["grip_mae_best"] for r in rows])),
+               grip_gt_mean=float(np.mean([r["grip_gt_mean"] for r in rows])),
+               grip_pred_mean=float(np.mean([r["grip_pred_mean_best"] for r in rows])),
+               pos_err_best_median=float(np.median([r["err_min"] for r in rows])),
+               pred_net_median=float(np.median([r["pred_net_from_cur_median"] for r in rows])),
+               gt_net_median=float(np.median([r["gt_net_from_cur"] for r in rows])))
+    out["net_ratio_pred_over_gt"] = out["pred_net_median"] / max(out["gt_net_median"], 1e-12)
+    return out
+
+
 def run_x2b(label, ckpt, samples, device, writer):
     from apt.infer.planner import load_model
     from examples.libero_r1.traj_select import motion_stats
@@ -163,16 +215,14 @@ def run_x2b(label, ckpt, samples, device, writer):
             for i, rec in enumerate(samples):
                 d = batch1(rec, device)
                 ppos, pgrip = predict(model, d, K_VA, seed=i, steps=steps, fp16=(prec == "bf16"))
-                gt = gt_pos(rec)
-                cur = rec["current_ee_pose"][0, :3, 3].double().numpy()
-                e = np.linalg.norm(ppos - gt[None], axis=-1).mean(axis=1)
-                m = motion_stats(ppos, pgrip, cur_pos=cur)
+                m = motion_stats(ppos, pgrip, cur_pos=cur_pos(rec))
+                sr = sample_record(ppos, pgrip, rec)
                 row = dict(model=label, steps=steps, precision=prec, sample=i,
                            adj_disp_median=round(m["adj_disp_median"], 6),
                            p95_over_median=round(m["adj_disp_p95"] / max(m["adj_disp_median"], 1e-12), 4),
                            net_disp_median=round(m["net_disp_median"], 6),
-                           err_min=round(float(e.min()), 6), err_mean=round(float(e.mean()), 6),
-                           grip_std_median=round(m["grip_std_median"], 6))
+                           grip_std_median=round(m["grip_std_median"], 6),
+                           **{k: round(v, 6) for k, v in sr.items()})
                 writer.writerow(row)
                 acc.append(row)
             key = f"steps{steps}_{prec}"
@@ -180,6 +230,7 @@ def run_x2b(label, ckpt, samples, device, writer):
                         ("adj_disp_median", "p95_over_median", "net_disp_median", "grip_std_median")}
             out[key].update(err_min_mean=float(np.mean([r["err_min"] for r in acc])),
                             err_mean_mean=float(np.mean([r["err_mean"] for r in acc])), n=len(acc))
+            out[key].update(extra_summary(acc))
             print(f"[X2b] {label} {key}: {out[key]}", flush=True)
     del model
     torch.cuda.empty_cache()
@@ -190,22 +241,25 @@ def run_model(label, ckpt, samples, device, writers):
     from apt.infer.planner import _repeat_batch, load_model
     model, _cfg = load_model(ckpt, device)
     stage = model.r1_meta["train_stage"]
-    errs, adj_pred, loss_acc = [], [], {b: [] for b in range(len(BINS))}
+    errs, adj_pred, loss_acc, rows_extra = [], [], {b: [] for b in range(len(BINS))}, []
     for i, rec in enumerate(samples):
         d = batch1(rec, device)
         gt = gt_pos(rec)  # (32, 3)
         Kp = K_VA if stage == 0 else 1
-        ppos, _pgrip = predict(model, d, Kp, seed=i)  # default steps (20), bf16
+        ppos, pgrip = predict(model, d, Kp, seed=i)  # default steps (20), bf16
         with torch.inference_mode():
             vl_in, vl_out = model.vlm(obs_rgbs=d["obs_rgbs"], obs_masks=d["obs_masks"],
                                       obs_norm_xys=d["obs_norm_xys"], obs_extrinsics=d["obs_extrinsics"],
                                       prompt_text=d["prompt_text"], fp16=True)
             e = np.linalg.norm(ppos - gt[None], axis=-1).mean(axis=1)  # (Kp,)
             m = motion(ppos)
+            sr = sample_record(ppos, pgrip, rec)
             row = dict(model=label, train_stage=stage, sample=i, err_min=round(float(e.min()), 6),
                        err_mean=round(float(e.mean()), 6), pred_adj_disp_median=round(m["adj_disp_median"], 6),
-                       pred_adj_disp_p95=round(m["adj_disp_p95"], 6), pred_net_disp_median=round(m["net_disp_median"], 6))
+                       pred_adj_disp_p95=round(m["adj_disp_p95"], 6), pred_net_disp_median=round(m["net_disp_median"], 6),
+                       **{k: round(v, 6) for k, v in sr.items() if k not in ("err_min", "err_mean")})
             writers["pred"].writerow(row)
+            rows_extra.append(sr)
             errs.append((e.min(), e.mean()))
             adj_pred.append(m["adj_disp_median"])
 
@@ -235,6 +289,7 @@ def run_model(label, ckpt, samples, device, writers):
                 loss_by_bin={f"{lo}-{hi - 1}": {k: float(np.mean([m[k] for m in loss_acc[b]]))
                                                  for k in ("pos_loss", "rot_loss", "openness_loss", "total_loss")}
                              for b, (lo, hi) in enumerate(BINS)})
+    summ.update(extra_summary(rows_extra))
     return summ
 
 
@@ -247,7 +302,7 @@ def main(args):
         with open(os.path.join(args.out_dir, "x2b_pred.csv"), "w", newline="") as fp:
             w = csv.DictWriter(fp, fieldnames=["model", "steps", "precision", "sample", "adj_disp_median",
                                                "p95_over_median", "net_disp_median", "err_min", "err_mean",
-                                               "grip_std_median"])
+                                               "grip_std_median"] + EXTRA_FIELDS)
             w.writeheader()
             for item in args.models:
                 label, ckpt = item.split("=", 1)
@@ -283,7 +338,7 @@ def main(args):
     fp_loss = open(os.path.join(args.out_dir, "x2_loss.csv"), "w", newline="")
     writers = {"pred": csv.DictWriter(fp_pred, fieldnames=["model", "train_stage", "sample", "err_min", "err_mean",
                                                            "pred_adj_disp_median", "pred_adj_disp_p95",
-                                                           "pred_net_disp_median"]),
+                                                           "pred_net_disp_median"] + EXTRA_FIELDS),
                "loss": csv.DictWriter(fp_loss, fieldnames=["model", "sample", "bin", "pos_loss", "rot_loss",
                                                            "openness_loss", "total_loss"])}
     writers["pred"].writeheader()
@@ -303,9 +358,17 @@ def main(args):
         json.dump(summary, fp, indent=2)
     for label, s in summary["models"].items():
         if s["train_stage"] == 1:
-            e = s["pos_err_mean_of_mean"]
-            print(f"[X2-SMOKE-3] {label} mean 32-step position error = {e*100:.2f} cm (<= 3 cm) -> "
-                  f"{'PASS' if e <= 0.03 else 'FAIL (data reading/conversion differs from VLA training data)'}")
+            # spec section 11, ruling 1: median of the per-sample 32-step mean position error <= 4 cm
+            # and median(pred net displacement) / median(gt net displacement) in [0.7, 1.4]
+            e, r = s["pos_err_best_median"], s["net_ratio_pred_over_gt"]
+            ok = e <= 0.04 and 0.7 <= r <= 1.4
+            print(f"[X2-SMOKE-3] {label}: median 32-step position error = {e*100:.2f} cm (<= 4 cm), "
+                  f"net displacement ratio pred/gt = {r:.2f} (0.7-1.4) -> "
+                  f"{'PASS' if ok else 'FAIL (data reading/conversion differs from VLA training data)'}")
+            print(f"[X2] {label}: step errors (m) " +
+                  ", ".join(f"{k}:{s[f'err_step{k}_median']:.4f}" for k in STEP_IDS) +
+                  f"; gripper MAE median {s['grip_mae_median']:.3f}, mean gt {s['grip_gt_mean']:.3f}, "
+                  f"mean pred {s['grip_pred_mean']:.3f}")
 
 
 if __name__ == "__main__":

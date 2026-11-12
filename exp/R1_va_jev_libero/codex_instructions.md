@@ -90,7 +90,7 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
      --models vla=checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt \
      --out_dir results/R1/R1X/smoke 2>&1 | tee results/R1/R1X/smoke_x2.log
    ```
-   通过：`[X2-SMOKE-3] vla mean 32-step position error = … cm (<= 3 cm) -> PASS`。不通过：停止并回传（说明数据读取或转换与 VLA 训练数据不一致）。
+   **已完成（2026-11-12），不重跑。** 规格第 11 节第 1 条改为：VLA 平均位置误差的中位数 ≤ 4 cm，且预测与真值 32 步净位移中位数之比在 0.7–1.4（实测 2.85 cm、0.90，记为通过）。`results/R1/R1X/smoke/` 保留原样。
 5. **X2 全量**：
    ```bash
    CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1x_x2 \
@@ -99,7 +99,9 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
               va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
      --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x2.log
    ```
-   输出 `x2_gt.csv`（真值统计）、`x2_pred.csv`（逐样本预测误差与平滑度）、`x2_loss.csv`（逐样本 × 时间步档的 loss）、`x2_summary.json`。`x2_samples.pt` 是 200 个样本的缓存，不打包。
+   先 `git pull`，代码须包含规格第 11 节第 3 条的新增记录（`git log` 中应有 "spec section 11" 的提交）。
+   输出 `x2_gt.csv`（真值统计）、`x2_pred.csv`（逐样本预测误差、平滑度、第 1/2/4/8/16/32 步位置误差、夹爪平均绝对差与均值）、`x2_loss.csv`（逐样本 × 时间步档的 loss）、`x2_summary.json`。`x2_samples.pt` 是 200 个样本的缓存，不打包。
+   运行结束时会按新判据打印 `[X2-SMOKE-3] vla: median … cm (<= 4 cm), net displacement ratio pred/gt = … (0.7-1.4) -> PASS/FAIL`，并打印 VLA 的逐步误差与夹爪误差。若为 FAIL：不跑 X2b，停止并回传。
 6. **X2b（规格第 10 节第 4 条）**，X2 全量之后、同一 `--out_dir`（复用 `x2_samples.pt` 缓存，样本和噪声种子与 X2 相同），只跑两个 VA：
    ```bash
    CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1x_x2 --x2b \
@@ -107,7 +109,7 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
               va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
      --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x2b.log
    ```
-   8 组 = 2 模型 × 扩散推理步数 {20, 100} × 动作专家精度 {bf16, fp32}，每样本 8 条。输出 `x2b_pred.csv`（每模型 × 设置 × 样本一行）和 `x2b_summary.json`。冻结的 VLM 始终按训练时的 bf16 运行，精度设置只作用于动作专家。若 fp32 组报错，保留 bf16 组结果并回传完整报错栈。
+   8 组 = 2 模型 × 扩散推理步数 {20, 100} × 动作专家精度 {bf16, fp32}，每样本 8 条。输出 `x2b_pred.csv`（每模型 × 设置 × 样本一行，含与 X2 相同的逐步误差和夹爪误差字段）和 `x2b_summary.json`。冻结的 VLM 始终按训练时的 bf16 运行，精度设置只作用于动作专家。若 fp32 组报错，保留 bf16 组结果并回传完整报错栈。
 7. **回传**：
    ```bash
    tar --exclude='*.pt' -czf R1X_results.tar.gz results/R1/R1X
@@ -221,4 +223,9 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 2. 放行 X2，按 9.2 节原样执行（5B 第 4、5 步）。
 3. 新增 X2b：`apt_va` 与 40k VA × 推理步数 {20, 100} × 精度 {bf16, fp32}（5B 第 6 步）。
 4. 复制观测路径下 VLA 的单步巨大跳变本轮不查，正式运行不用该路径。
+
+## 12. 规格第 11 节要点
+1. X2 冒烟第 3 条改为：VLA 平均位置误差中位数 ≤ 4 cm，且预测/真值净位移中位数之比 0.7–1.4；冒烟记为通过，不重跑。
+2. 放行 X2 全量和 X2b（5B 第 5、6 步）。
+3. X2 和 X2b 新增记录：第 1、2、4、8、16、32 步位置误差中位数（VA 取 8 条中平均误差最小的那条）；夹爪开合度平均绝对差中位数，以及真值、预测各自的均值。净位移统一从查询时末端位置量起。
 
