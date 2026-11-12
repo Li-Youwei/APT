@@ -75,6 +75,9 @@ def main(args):
     setup_log_level("WARNING")
     os.makedirs(args.out_dir, exist_ok=True)
     csv_path = os.path.join(args.out_dir, "x1_rows.csv")
+    if args.summarize_only:
+        summarize(csv_path, args.out_dir)
+        return
     done = set()
     if os.path.exists(csv_path):
         with open(csv_path, newline="") as fp:
@@ -170,9 +173,14 @@ def summarize(csv_path, out_dir):
         print("   ", r)
     vla_rows = [r for r in rows if r["model"] == "vla"]
     if vla_rows:
-        worst = max(float(r["adj_disp_median"]) for r in vla_rows)
-        print(f"[X1-SMOKE-2] VLA adjacent-step displacement median, worst row = {worst*100:.3f} cm "
-              f"(<= 1 cm) -> {'PASS' if worst <= 0.01 else 'FAIL (diagnostic script is wrong)'}")
+        # spec section 10, ruling 1: speed-independent criterion, every VLA row must satisfy
+        # p95 / median of adjacent-step displacement <= 2.0 and clusters at 0.08 m <= 3
+        ratios = [float(r["adj_disp_p95"]) / max(float(r["adj_disp_median"]), 1e-12) for r in vla_rows]
+        ncls = [int(r["n_clusters_008"]) for r in vla_rows]
+        ok = all(x <= 2.0 for x in ratios) and all(n <= 3 for n in ncls)
+        print(f"[X1-SMOKE-2] VLA rows: worst p95/median = {max(ratios):.2f} (<= 2.0), "
+              f"max clusters = {max(ncls)} (<= 3) over {len(vla_rows)} rows -> "
+              f"{'PASS' if ok else 'FAIL (diagnostic script is wrong)'}")
 
 
 def build_argparser():
@@ -188,6 +196,8 @@ def build_argparser():
     p.add_argument("--ref_cams", nargs="+", default=list(REF_CAMS), choices=REF_CAMS)
     p.add_argument("--vis_model", default="va40k")
     p.add_argument("--out_dir", default="results/R1/R1X")
+    p.add_argument("--summarize_only", action="store_true",
+                   help="recompute x1_summary.csv and the smoke check from existing x1_rows.csv (no servers)")
     return p
 
 

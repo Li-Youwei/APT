@@ -78,6 +78,11 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
      --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x1.log
    ```
    输出 `x1_rows.csv`、`x1_summary.csv`、`x1_vis/va40k_goal_t*.png`（10 张，白线为 VLA 参照）。可续跑。
+   **已完成（2026-11-12），不重跑。** 冒烟第 2 条已由规格第 10 节第 1 条改为：VLA 每行相邻步位移“95 分位 ÷ 中位数”≤ 2.0 且 0.08 m 下聚类数 ≤ 3。代码更新后在 LIBERO 环境用已有记录重新判定一次（不需要服务，只读写 `x1_summary.csv`），日志存下来：
+   ```bash
+   python -u -m examples.libero_r1.diag_r1x --summarize_only --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x1_resummarize.log
+   ```
+   预期 `[X1-SMOKE-2] VLA rows: worst p95/median = 1.79 (<= 2.0), max clusters = 2 (<= 3) over 40 rows -> PASS`。
 3. 停掉两个推理服务，释放 GPU。
 4. **X2 冒烟（规格 9.4 第 3 条）**，APT 环境（需 `APT_DATA_LOC_HOST=r1`）：
    ```bash
@@ -95,13 +100,21 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
      --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x2.log
    ```
    输出 `x2_gt.csv`（真值统计）、`x2_pred.csv`（逐样本预测误差与平滑度）、`x2_loss.csv`（逐样本 × 时间步档的 loss）、`x2_summary.json`。`x2_samples.pt` 是 200 个样本的缓存，不打包。
-6. **回传**：
+6. **X2b（规格第 10 节第 4 条）**，X2 全量之后、同一 `--out_dir`（复用 `x2_samples.pt` 缓存，样本和噪声种子与 X2 相同），只跑两个 VA：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1x_x2 --x2b \
+     --models apt_va=checkpoints/hf/apt_va/ckpt_latest.pt \
+              va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
+     --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x2b.log
+   ```
+   8 组 = 2 模型 × 扩散推理步数 {20, 100} × 动作专家精度 {bf16, fp32}，每样本 8 条。输出 `x2b_pred.csv`（每模型 × 设置 × 样本一行）和 `x2b_summary.json`。冻结的 VLM 始终按训练时的 bf16 运行，精度设置只作用于动作专家。若 fp32 组报错，保留 bf16 组结果并回传完整报错栈。
+7. **回传**：
    ```bash
    tar --exclude='*.pt' -czf R1X_results.tar.gz results/R1/R1X
    ```
    另附：两个服务的完整日志、`git rev-parse HEAD`、`nvidia-smi`。X3 的书面回答在仓库 `exp/R1_va_jev_libero/r1x_x3_answers.md`，不需要 Codex 处理。
 
-R1-X 只新增诊断入口（`sample_trajs_legacy`、`ActionExpert.forward` 的可选 `train_timesteps`），没有改变任何已有推理或训练路径的行为，满足规格 9 节“在未修改的代码上留证据”的要求。
+R1-X 只新增诊断入口（`sample_trajs_legacy`、`ActionExpert.forward` 的可选 `train_timesteps`，X2b 的推理步数和精度只在诊断脚本里对已加载的模型临时设置），没有改变任何已有推理或训练路径的行为，满足规格 9 节“在未修改的代码上留证据”的要求。规格第 10 节第 5 条：复制观测路径下 VLA 的单步巨大跳变本轮不查，`x1_rows.csv` 原样保留。
 
 ## 5A. 2026-11-12 恢复执行（规格第 8 节第 7 条）（第 2 步之后暂停，见 5B）
 
@@ -202,4 +215,10 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 2. C 臂全量、A 臂全量、800 步附加检查暂停；R1-D 结果作废，修复后整体重跑。
 3. 冒烟 4 记为通过（VLA 参照轨迹起点落在夹爪上）。
 4. 诊断实验 R1-X：X1 推理路径对照、X2 训练数据开环对照、X3 代码核对（书面回答见 `r1x_x3_answers.md`）。执行见 5B。
+
+## 11. 规格第 10 节要点
+1. X1 冒烟第 2 条改为“95 分位 ÷ 中位数 ≤ 2.0 且聚类数 ≤ 3”，X1 记为通过，不重跑（5B 第 2 步的重新判定只是留记录）。
+2. 放行 X2，按 9.2 节原样执行（5B 第 4、5 步）。
+3. 新增 X2b：`apt_va` 与 40k VA × 推理步数 {20, 100} × 精度 {bf16, fp32}（5B 第 6 步）。
+4. 复制观测路径下 VLA 的单步巨大跳变本轮不查，正式运行不用该路径。
 

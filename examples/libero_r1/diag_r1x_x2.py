@@ -25,6 +25,22 @@ Ground-truth statistics (adjacent-step displacement median / p95 / max, net
 displacement) are model independent.
 Outputs: x2_gt.csv, x2_pred.csv, x2_loss.csv, x2_summary.json; smoke check 3:
 VLA mean position error <= 3 cm.
+
+X2b (spec section 10, ruling 4) -- inference-setting control on the SAME cached
+samples and noise seeds, only for the VA models passed in --models:
+
+  CUDA_VISIBLE_DEVICES=0 python -m examples.libero_r1.diag_r1x_x2 --x2b \
+      --models apt_va=checkpoints/hf/apt_va/ckpt_latest.pt \
+               va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
+      --out_dir results/R1/R1X
+
+  diffusion inference steps {20, 100} x action-expert precision {bf16, fp32},
+  8 trajectories per sample. Steps are set on the loaded model instance only
+  (ActionExpert.inference_timesteps); precision is the action expert's `fp16`
+  flag. The frozen VLM always runs in bf16 as in training: its weights are
+  loaded in bf16 and CUDA autocast has no fp32 mode, so for fp32 the VLM
+  features are cast to fp32 before the action expert. No default path changes.
+  Outputs x2b_pred.csv (one row per model x setting x sample) and x2b_summary.json.
 """
 from __future__ import annotations
 
@@ -38,6 +54,8 @@ import numpy as np
 import torch
 
 N_SAMPLES = 200
+X2B_STEPS = (20, 100)
+X2B_PRECISIONS = ("bf16", "fp32")
 SEED = 0
 K_VA = 8
 BINS = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
@@ -86,30 +104,102 @@ def batch1(rec, device):
     return out
 
 
-def run_model(label, ckpt, samples, device, writers):
-    from apt.infer.planner import _repeat_batch, load_model
-    model, _cfg = load_model(ckpt, device)
-    stage = model.r1_meta["train_stage"]
+def _to_float32(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.float() if obj.is_floating_point() else obj
+    if isinstance(obj, dict):
+        return {k: _to_float32(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_float32(v) for v in obj]
+    return obj
+
+
+def predict(model, d, Kp, seed, steps=None, fp16=True):
+    """Kp trajectories for one batch-1 sample; noise = default_rng(seed). Returns
+    predicted positions (Kp, Ta, 3) and grippers (Kp, Ta) as float64 numpy.
+    steps / fp16 only change this call (restored afterwards)."""
+    from apt.infer.planner import _repeat_batch
     act_dim = model.actor.act_dim
-    errs, adj_pred, loss_acc = [], [], {b: [] for b in range(len(BINS))}
-    for i, rec in enumerate(samples):
-        d = batch1(rec, device)
-        gt = rec["gt_future_ee_states"][:, 0, :16].reshape(-1, 4, 4)[:, :3, 3].double().numpy()  # (32, 3)
+    old_steps = model.actor.inference_timesteps
+    if steps is not None:
+        model.actor.inference_timesteps = int(steps)
+    try:
         with torch.inference_mode():
             vl_in, vl_out = model.vlm(obs_rgbs=d["obs_rgbs"], obs_masks=d["obs_masks"],
                                       obs_norm_xys=d["obs_norm_xys"], obs_extrinsics=d["obs_extrinsics"],
-                                      prompt_text=d["prompt_text"], fp16=True)
-            Kp = K_VA if stage == 0 else 1
+                                      prompt_text=d["prompt_text"], fp16=True)  # VLM always bf16 (as trained)
+            if not fp16:
+                vl_in, vl_out = _to_float32(vl_in), _to_float32(vl_out)
             Ta, nee = d["gt_future_ee_states"].shape[1:3]
-            noise = torch.from_numpy(np.random.default_rng(i).standard_normal((Kp, nee, Ta, act_dim))
-                                     .astype(np.float32)).to(device)
+            noise = torch.from_numpy(np.random.default_rng(seed).standard_normal((Kp, nee, Ta, act_dim))
+                                     .astype(np.float32)).to(d["obs_rgbs"].device)
             rep = _repeat_batch(d, Kp)
             pred = model.actor(vl_inputs=_repeat_batch(vl_in, Kp), vl_outputs=_repeat_batch(vl_out, Kp),
                                current_ee_pose=rep["current_ee_pose"], action_ref_pose=rep["action_ref_pose"],
                                history_ee_states=rep["history_ee_states"],
                                gt_future_ee_states=rep["gt_future_ee_states"], valid_ee_mask=rep["valid_ee_mask"],
-                               inference=True, fp16=True, initial_noise=noise)
-            ppos = pred.float()[:, :, 0, :16].reshape(Kp, Ta, 4, 4)[..., :3, 3].double().cpu().numpy()
+                               inference=True, fp16=fp16, initial_noise=noise)
+    finally:
+        model.actor.inference_timesteps = old_steps
+    pred = pred.float()[:, :, 0]
+    ppos = pred[..., :16].reshape(Kp, Ta, 4, 4)[..., :3, 3].double().cpu().numpy()
+    pgrip = pred[..., 16].double().cpu().numpy()
+    return ppos, pgrip
+
+
+def gt_pos(rec):
+    return rec["gt_future_ee_states"][:, 0, :16].reshape(-1, 4, 4)[:, :3, 3].double().numpy()
+
+
+def run_x2b(label, ckpt, samples, device, writer):
+    from apt.infer.planner import load_model
+    from examples.libero_r1.traj_select import motion_stats
+    model, _cfg = load_model(ckpt, device)
+    assert model.r1_meta["train_stage"] == 0, f"X2b is for VA models only: {label}"
+    out = {}
+    for steps in X2B_STEPS:
+        for prec in X2B_PRECISIONS:
+            acc = []
+            for i, rec in enumerate(samples):
+                d = batch1(rec, device)
+                ppos, pgrip = predict(model, d, K_VA, seed=i, steps=steps, fp16=(prec == "bf16"))
+                gt = gt_pos(rec)
+                cur = rec["current_ee_pose"][0, :3, 3].double().numpy()
+                e = np.linalg.norm(ppos - gt[None], axis=-1).mean(axis=1)
+                m = motion_stats(ppos, pgrip, cur_pos=cur)
+                row = dict(model=label, steps=steps, precision=prec, sample=i,
+                           adj_disp_median=round(m["adj_disp_median"], 6),
+                           p95_over_median=round(m["adj_disp_p95"] / max(m["adj_disp_median"], 1e-12), 4),
+                           net_disp_median=round(m["net_disp_median"], 6),
+                           err_min=round(float(e.min()), 6), err_mean=round(float(e.mean()), 6),
+                           grip_std_median=round(m["grip_std_median"], 6))
+                writer.writerow(row)
+                acc.append(row)
+            key = f"steps{steps}_{prec}"
+            out[key] = {k: float(np.median([r[k] for r in acc])) for k in
+                        ("adj_disp_median", "p95_over_median", "net_disp_median", "grip_std_median")}
+            out[key].update(err_min_mean=float(np.mean([r["err_min"] for r in acc])),
+                            err_mean_mean=float(np.mean([r["err_mean"] for r in acc])), n=len(acc))
+            print(f"[X2b] {label} {key}: {out[key]}", flush=True)
+    del model
+    torch.cuda.empty_cache()
+    return out
+
+
+def run_model(label, ckpt, samples, device, writers):
+    from apt.infer.planner import _repeat_batch, load_model
+    model, _cfg = load_model(ckpt, device)
+    stage = model.r1_meta["train_stage"]
+    errs, adj_pred, loss_acc = [], [], {b: [] for b in range(len(BINS))}
+    for i, rec in enumerate(samples):
+        d = batch1(rec, device)
+        gt = gt_pos(rec)  # (32, 3)
+        Kp = K_VA if stage == 0 else 1
+        ppos, _pgrip = predict(model, d, Kp, seed=i)  # default steps (20), bf16
+        with torch.inference_mode():
+            vl_in, vl_out = model.vlm(obs_rgbs=d["obs_rgbs"], obs_masks=d["obs_masks"],
+                                      obs_norm_xys=d["obs_norm_xys"], obs_extrinsics=d["obs_extrinsics"],
+                                      prompt_text=d["prompt_text"], fp16=True)
             e = np.linalg.norm(ppos - gt[None], axis=-1).mean(axis=1)  # (Kp,)
             m = motion(ppos)
             row = dict(model=label, train_stage=stage, sample=i, err_min=round(float(e.min()), 6),
@@ -152,6 +242,20 @@ def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     device = "cuda:0"
     samples = build_samples(os.path.join(args.out_dir, "x2_samples.pt"))
+    if args.x2b:
+        res = {}
+        with open(os.path.join(args.out_dir, "x2b_pred.csv"), "w", newline="") as fp:
+            w = csv.DictWriter(fp, fieldnames=["model", "steps", "precision", "sample", "adj_disp_median",
+                                               "p95_over_median", "net_disp_median", "err_min", "err_mean",
+                                               "grip_std_median"])
+            w.writeheader()
+            for item in args.models:
+                label, ckpt = item.split("=", 1)
+                res[label] = run_x2b(label, ckpt, samples, device, w)
+                fp.flush()
+        with open(os.path.join(args.out_dir, "x2b_summary.json"), "w") as fp:
+            json.dump(res, fp, indent=2)
+        return
     # ground truth statistics
     gts = []
     with open(os.path.join(args.out_dir, "x2_gt.csv"), "w", newline="") as fp:
@@ -208,4 +312,5 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", required=True, help="label=checkpoint path")
     p.add_argument("--out_dir", default="results/R1/R1X")
+    p.add_argument("--x2b", action="store_true", help="run X2b (inference steps x precision) instead of X2")
     main(p.parse_args())
