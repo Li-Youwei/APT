@@ -570,6 +570,7 @@ class TrajPlanner(object):
                         obs_rgbs=rep["obs_rgbs"], obs_masks=rep["obs_masks"],
                         obs_norm_xys=rep["obs_norm_xys"], obs_extrinsics=rep["obs_extrinsics"],
                         prompt_text=rep["prompt_text"], fp16=True)
+                seq_len = int(vl_outputs["attention_mask"].shape[1])  # VLM tokens (vision + text + template)
                 actions: Tensor = self.model.actor(
                     vl_inputs=vl_inputs,
                     vl_outputs=vl_outputs,
@@ -593,5 +594,6 @@ class TrajPlanner(object):
             "gripper": actions[..., 16].astype(np.float32),
             "infer_time_s": float(infer_time),
             "ref_cam": ref_cam,
+            "seq_len": seq_len,
         }
 

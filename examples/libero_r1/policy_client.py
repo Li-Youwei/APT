@@ -71,4 +71,5 @@ class Policy:
             "infer_time_s": float(out["infer_time_s"]),
             "rpc_time_s": rpc_time,
             "ref_cam": ref_cam,
+            "seq_len": out.get("seq_len"),
         }

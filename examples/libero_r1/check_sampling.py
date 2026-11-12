@@ -15,6 +15,17 @@ and prints the timing of both paths. Exit code 1 if 1 or 2 fail; 3 is reported
 [4] (diagnostic, not a pass criterion) shows how far the same noise lands
 under the two reference cameras -- the mechanism behind the 2026-11-11 failure.
 
+Smoke-11 diagnostic (not a pass criterion; run on the VA server, then on the
+VLA server as a positive control):
+  python -m examples.libero_r1.check_sampling --uri va  --diag11
+  python -m examples.libero_r1.check_sampling --uri vla --diag11
+Compares the true instruction with (a) the spec's "do nothing", (b) "do
+nothing" padded to the SAME VLM token count, (c) other libero_goal
+instructions with the same token count. Equal token count means identical
+tensor shapes, so a VA without any language path must give a bit-exact (0)
+difference; a length mismatch alone changes kernel shapes and bf16 rounding,
+which the multimodal VA amplifies (compare check [3]).
+
 Smoke test 11 (spec section 7, ruling 2), VA server only:
   python -m examples.libero_r1.check_sampling --uri va --smoke11
 same observation, same noise, prompt = true instruction vs "do nothing":
@@ -47,8 +58,9 @@ def main(args):
 
     rng, _ = noise_streams(12345)
     noise = pol.noise(rng, args.K)
-    if args.smoke11:
-        assert pol.meta["train_stage"] == 0, f"smoke 11 needs the VA server: {pol.meta}"
+    if args.diag11:
+        diag11(pol, frame, instr, noise, suite)
+        sys.exit(0)
     if args.smoke11:
         assert pol.meta["train_stage"] == 0, f"smoke 11 needs the VA server: {pol.meta}"
         ok = True
@@ -96,6 +108,54 @@ def main(args):
     sys.exit(0 if ok else 1)
 
 
+def diag11(pol, frame, instr, noise, suite):
+    cam = REF_CAMS[0]
+    one = noise[:1]
+
+    def seq_len(prompt):
+        return pol.sample(frame, prompt, one, cam)["seq_len"]
+
+    def compare(tag, prompt, base):
+        o = pol.sample(frame, prompt, noise, cam)
+        d = np.abs(base["pos"] - o["pos"]).max()
+        dg = np.abs(base["grip"] - o["grip"]).max()
+        print(f"[D11] {tag:<34} tokens {base['seq_len']} vs {o['seq_len']}: max |pos diff| = {d:.3e} m "
+              f"({d*1000:.3f} mm), gripper {dg:.3e}{'  BIT-EXACT' if d == 0 and dg == 0 else ''}  prompt={prompt!r}")
+
+    print(f"[INFO] server train_stage={pol.meta['train_stage']} ckpt={pol.meta.get('ckpt_path')} ref_cam={cam}")
+    base = pol.sample(frame, instr, noise, cam)
+    assert base["seq_len"] is not None, "server does not report seq_len (old server code still running?)"
+    base2 = pol.sample(frame, instr, noise, cam)
+    print(f"[D11] repeat of the true instruction: max |pos diff| = {np.abs(base['pos']-base2['pos']).max():.3e} m")
+    target = base["seq_len"]
+    compare("(a) spec control", "do nothing", base)
+    matched = None
+    for k in range(0, 40):
+        cand = "do nothing" + " now" * k
+        n = seq_len(cand)
+        if n == target:
+            matched = cand
+            break
+        if n > target:
+            break
+    if matched is None:
+        print(f"[D11] (b) no 'do nothing now...' padding reaches exactly {target} tokens")
+    else:
+        compare("(b) 'do nothing' length-matched", matched, base)
+    n_other = 0
+    for t in range(suite.n_tasks):
+        other = suite.get_task(t).language
+        if other == instr:
+            continue
+        if seq_len(other) == target:
+            compare(f"(c) other goal task {t}, same length", other, base)
+            n_other += 1
+    if n_other == 0:
+        print(f"[D11] (c) no other libero_goal instruction has exactly {target} tokens")
+    print("[D11] reading: VA (train_stage 0) without a language path -> (b)/(c) BIT-EXACT; "
+          "VLA (train_stage 1) -> (b)/(c) clearly non-zero (positive control).")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--uri", default="va")
@@ -103,4 +163,5 @@ if __name__ == "__main__":
     p.add_argument("--ns_port", type=int, default=9091)
     p.add_argument("--K", type=int, default=32)
     p.add_argument("--smoke11", action="store_true", help="run only smoke test 11 (language-leak check)")
+    p.add_argument("--diag11", action="store_true", help="length-matched language-invariance diagnostic")
     main(p.parse_args())
