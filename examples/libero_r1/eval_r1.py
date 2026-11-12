@@ -209,6 +209,13 @@ def main(args):
     suite_name = args.suite
     assert suite_name in LC.SUITES, suite_name
     max_steps = LC.MAX_STEPS[suite_name]
+    if args.max_steps_override:
+        # spec section 8, ruling 8: D-arm extra check with a raised step cap only
+        assert args.arm == "vla", "--max_steps_override is only defined for the D arm (spec 8.8)"
+        assert args.run_name and args.run_name != args.arm, \
+            "use a separate --run_name (e.g. vla_cap800) so the main D-arm results are not mixed"
+        max_steps = int(args.max_steps_override)
+        print(f"[INFO] max steps overridden: {LC.MAX_STEPS[suite_name]} -> {max_steps}")
 
     va = vla = None
     selector = None
@@ -235,8 +242,10 @@ def main(args):
 
     suite = LC.get_suite(suite_name)
     task_end = min(args.task_end, suite.n_tasks)
+    task_ids = args.tasks if args.tasks else list(range(args.task_start, task_end))
+    assert all(0 <= t < suite.n_tasks for t in task_ids), task_ids
     n_succ = n_run = 0
-    for task_id in range(args.task_start, task_end):
+    for task_id in task_ids:
         episodes = list(range(args.episode_start, args.episode_start + args.episodes_per_task))
         todo = [e for e in episodes if (task_id, e) not in log.done]
         for e in episodes:
@@ -284,6 +293,10 @@ def build_argparser():
     p.add_argument("--suite", required=True, choices=LC.SUITES)
     p.add_argument("--task_start", type=int, default=0)
     p.add_argument("--task_end", type=int, default=10, help="exclusive")
+    p.add_argument("--tasks", nargs="*", type=int, default=None,
+                   help="explicit task ids (overrides --task_start/--task_end), e.g. 0 3 7")
+    p.add_argument("--max_steps_override", type=int, default=0,
+                   help="D arm only, spec 8.8 extra check (e.g. 800); requires a separate --run_name")
     p.add_argument("--episode_start", type=int, default=0)
     p.add_argument("--episodes_per_task", type=int, default=50)
     p.add_argument("--out_root", default="results/R1/R1C")

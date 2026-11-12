@@ -10,8 +10,9 @@ checks that
   2. different noise rows give different samples (independent noise),
   3. the shared-VLM path (one VLM pass, outputs repeated K times) matches the
      replicated-observation path (old `sample_num` behaviour) up to bf16 noise,
-and prints the timing of both paths. Exit code 1 if 1 or 2 fail; 3 is reported
-(WARN above 5 mm) because bf16 kernels may differ with batch layout.
+and prints the timing of both paths. Exit code 1 if 1 or 2 fail. [3] is
+information only (spec section 8, ruling 4): its WARN above 5 mm is expected
+bf16 amplification, not a failure; formal runs always use the shared path.
 [4] (diagnostic, not a pass criterion) shows how far the same noise lands
 under the two reference cameras -- the mechanism behind the 2026-11-11 failure.
 
@@ -26,11 +27,15 @@ tensor shapes, so a VA without any language path must give a bit-exact (0)
 difference; a length mismatch alone changes kernel shapes and bf16 rounding,
 which the multimodal VA amplifies (compare check [3]).
 
-Smoke test 11 (spec section 7, ruling 2), VA server only:
-  python -m examples.libero_r1.check_sampling --uri va --smoke11
-same observation, same noise, prompt = true instruction vs "do nothing":
-PASS iff the max element-wise difference of the 32 returned EE positions is
-<= 1e-4 m. FAIL means language leaks into the VA: stop and report.
+Smoke test 11 (spec section 8, rulings 1-3), run on BOTH servers:
+  python -m examples.libero_r1.check_sampling --uri va  --smoke11   # VA 40k
+  python -m examples.libero_r1.check_sampling --uri vla --smoke11   # positive control
+Control prompt = "do nothing" padded with " now" to the SAME VLM token count as
+the true instruction; same observation, noise and reference camera (both
+cameras checked). PASS on the VA server (train_stage 0): max element-wise
+position difference <= 1e-4 m for every camera. PASS on the VLA server
+(train_stage 1): difference > 0.01 m for every camera. FAIL on the VA side
+means language leaks into the VA: stop and report.
 """
 from __future__ import annotations
 
@@ -62,17 +67,7 @@ def main(args):
         diag11(pol, frame, instr, noise, suite)
         sys.exit(0)
     if args.smoke11:
-        assert pol.meta["train_stage"] == 0, f"smoke 11 needs the VA server: {pol.meta}"
-        ok = True
-        for cam in REF_CAMS:
-            a = pol.sample(frame, instr, noise, cam)
-            z = pol.sample(frame, "do nothing", noise, cam)
-            d = np.abs(a["pos"] - z["pos"]).max()
-            dg = np.abs(a["grip"] - z["grip"]).max()
-            ok &= bool(d <= 1e-4)
-            print(f"[SMOKE-11] ref_cam={cam}: instruction {instr!r} vs 'do nothing': max |diff| of positions = "
-                  f"{d:.3e} m (gripper max |diff| {dg:.3e}) -> {'PASS' if d <= 1e-4 else 'FAIL (language leak?)'}")
-        sys.exit(0 if ok else 1)
+        sys.exit(0 if smoke11(pol, frame, instr, noise) else 1)
 
     ok = True
     first = {}
@@ -95,7 +90,7 @@ def main(args):
         ok &= bool(spread.min() > 0)
 
         d_share = np.linalg.norm(a["pos"] - c["pos"], axis=-1).max(axis=-1)  # per sample, metres
-        tag = "OK" if np.median(d_share) <= 0.005 else "WARN"
+        tag = "OK" if np.median(d_share) <= 0.005 else "WARN (info only, spec 8.4)"
         print(f"[3] ref_cam={cam} shared VLM vs replicated obs: per-sample max pos diff median "
               f"{np.median(d_share)*1000:.2f} mm, max {d_share.max()*1000:.2f} mm; gripper max diff "
               f"{np.abs(a['grip']-c['grip']).max():.3f} -> {tag}")
@@ -106,6 +101,54 @@ def main(args):
     print(f"[4] diagnostic: same noise, agentview vs eye_in_hand reference: per-sample max pos diff median "
           f"{np.median(d_cam)*1000:.2f} mm, max {d_cam.max()*1000:.2f} mm (expected large; explains the old [1] FAIL)")
     sys.exit(0 if ok else 1)
+
+
+SMOKE11_VA_MAX = 1e-4    # m, spec 8.2
+SMOKE11_VLA_MIN = 0.01   # m, spec 8.2 positive control
+PAD_WORD = " now"
+
+
+def length_matched_control(pol, frame, instr, cam, base="do nothing", max_pad=60):
+    """`base` + PAD_WORD * k with the same VLM token count as `instr`, or None."""
+    one = np.zeros((1, pol.meta["nee"], pol.meta["ta"], pol.meta["act_dim"]), np.float32)
+    target = pol.sample(frame, instr, one, cam)["seq_len"]
+    assert target is not None, "server does not report seq_len (old server code still running?)"
+    for k in range(max_pad + 1):
+        cand = base + PAD_WORD * k
+        n = pol.sample(frame, cand, one, cam)["seq_len"]
+        if n == target:
+            return cand, target
+        if n > target:
+            break
+    return None, target
+
+
+def smoke11(pol, frame, instr, noise) -> bool:
+    stage = pol.meta["train_stage"]
+    assert stage in (0, 1), pol.meta
+    print(f"[INFO] smoke 11 on train_stage={stage} server, ckpt={pol.meta.get('ckpt_path')} "
+          f"(iter {pol.meta.get('current_iters')})")
+    ok = True
+    for cam in REF_CAMS:
+        ctrl, n_tok = length_matched_control(pol, frame, instr, cam)
+        if ctrl is None:
+            print(f"[SMOKE-11] ref_cam={cam}: cannot pad 'do nothing' to exactly {n_tok} tokens -> FAIL (cannot evaluate)")
+            ok = False
+            continue
+        a = pol.sample(frame, instr, noise, cam)
+        z = pol.sample(frame, ctrl, noise, cam)
+        assert a["seq_len"] == z["seq_len"] == n_tok, (a["seq_len"], z["seq_len"], n_tok)
+        d = float(np.abs(a["pos"] - z["pos"]).max())
+        dg = float(np.abs(a["grip"] - z["grip"]).max())
+        if stage == 0:
+            passed, rule = d <= SMOKE11_VA_MAX, f"VA: <= {SMOKE11_VA_MAX:g} m"
+        else:
+            passed, rule = d > SMOKE11_VLA_MIN, f"VLA positive control: > {SMOKE11_VLA_MIN:g} m"
+        ok &= bool(passed)
+        print(f"[SMOKE-11] ref_cam={cam}: {instr!r} vs {ctrl!r} ({n_tok} tokens each): max |diff| of positions = "
+              f"{d:.3e} m ({d*1000:.3f} mm), gripper {dg:.3e}; rule {rule} -> {'PASS' if passed else 'FAIL'}")
+    print(f"[SMOKE-11] overall ({'VA' if stage == 0 else 'VLA'} side): {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def diag11(pol, frame, instr, noise, suite):
@@ -162,6 +205,7 @@ if __name__ == "__main__":
     p.add_argument("--ns_host", default="localhost")
     p.add_argument("--ns_port", type=int, default=9091)
     p.add_argument("--K", type=int, default=32)
-    p.add_argument("--smoke11", action="store_true", help="run only smoke test 11 (language-leak check)")
+    p.add_argument("--smoke11", action="store_true",
+                   help="run only smoke test 11 (token-matched language check; VA and VLA servers)")
     p.add_argument("--diag11", action="store_true", help="length-matched language-invariance diagnostic")
     main(p.parse_args())

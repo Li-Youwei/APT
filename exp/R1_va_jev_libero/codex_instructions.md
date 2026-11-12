@@ -53,21 +53,66 @@ pyro4-ns -p 9091 &
 CUDA_VISIBLE_DEVICES=1 python -m apt.infer.remote_service --ckpt checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt --uri vla --ns_port 9091 --ensemble 0 &
 CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt checkpoints/APT/va_libero4_r1/ckpt_0040000.pt --uri va --ns_port 9091 --ensemble 0 &
 ```
-VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_sampling --uri va` —— 两个参考相机（agentview、eye_in_hand）各自的 [1][2] 必须 PASS；[3] 的数值写入结果包（共享 VLM 与复制观测的差异）；[4] 只是诊断输出（同一噪声在两个参考相机下的差异，预期很大）。
+VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_sampling --uri va` —— 两个参考相机（agentview、eye_in_hand）各自的 [1][2] 必须 PASS；[3] 只记录数值，WARN 不算失败（规格 8.4）；[4] 只是诊断输出（同一噪声在两个参考相机下的差异，预期很大）。
+
+**推理配置固定（规格 8.5）**：所有臂、所有 episode 都用共享骨干（`share_vlm=True`，代码默认，命令行不可改）、bf16（服务端固定）、VA 每次查询 K=32（`traj_select.K_SAMPLES`）。不要改服务端代码、不要换服务启动参数；任何一项中途变化，受影响的 suite 整体重跑。
 
 > 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
-## 5. 按第 6 节顺序执行
+## 5A. 2026-11-12 恢复执行（规格第 8 节第 7 条）—— 现在从这里开始
+
+已完成且保留、不重跑：R1-T、D 臂全量（平均 91.75%，规格 8.6 接受为参照系）、R1-D 冒烟（冒烟 3、4）。
+
+0. 更新代码并重启服务：`git pull`（分支 `r1-phase1`），然后按第 4 节命令重启 pyro4-ns、VLA 服务（GPU1）和 **40k** VA 服务（GPU0）。以下命令都在 LIBERO 环境、仓库根目录执行，环境变量同第 0 节。
+1. **冒烟 11（40k，规格 8.1–8.3）**，两条命令都必须退出码 0：
+   ```bash
+   python -u -m examples.libero_r1.check_sampling --uri va  --smoke11
+   python -u -m examples.libero_r1.check_sampling --uri vla --smoke11
+   ```
+   判据：对照指令为补到与真实指令 token 数相同的 `do nothing now now …`；VA 侧每个参考相机位置最大差 ≤ 1e-4 m，VLA 侧（阳性对照）每个参考相机 > 0.01 m。输出 `[SMOKE-11] overall (VA side): PASS` 与 `overall (VLA side): PASS`。VA 侧失败：停止并回传。日志存 `results/R1/smoke/smoke11_40k_{va,vla}.log`。
+2. **R1-D 全量**：
+   ```bash
+   python -u -m examples.libero_r1.diag_r1d --va_ckpts $PWD/checkpoints/APT/va_libero4_r1/ckpt_00{1,2,3,4}0000.pt --out_dir results/R1/R1D
+   ```
+   结束时 VA 服务停在最后加载的 40k 权重上，可直接继续。
+3. **C 臂冒烟（冒烟 6，≥3/6）**：
+   ```bash
+   python -u -m examples.libero_r1.eval_r1 --arm va_oracle --suite libero_goal --task_end 2 --episodes_per_task 3 --out_root results/R1/smoke --run_name C
+   ```
+4. **冒烟 9（A 臂可复现）与冒烟 10（断点续跑）**：
+   ```bash
+   python -u -m examples.libero_r1.eval_r1 --arm va_random --suite libero_goal --task_end 1 --episodes_per_task 1 --out_root results/R1/smoke --run_name A_rep1
+   python -u -m examples.libero_r1.eval_r1 --arm va_random --suite libero_goal --task_end 1 --episodes_per_task 1 --out_root results/R1/smoke --run_name A_rep2
+   python -m examples.libero_r1.check_repro same results/R1/smoke/A_rep1/libero_goal results/R1/smoke/A_rep2/libero_goal
+   python -u -m examples.libero_r1.eval_r1 --arm va_random --suite libero_goal --task_end 1 --episodes_per_task 2 --out_root results/R1/smoke --run_name resume --debug_kill_at_query 45   # 预期退出码 17
+   python -u -m examples.libero_r1.eval_r1 --arm va_random --suite libero_goal --task_end 1 --episodes_per_task 2 --out_root results/R1/smoke --run_name resume   # 日志应有 [SKIP]
+   python -m examples.libero_r1.check_repro unique results/R1/smoke/resume/libero_goal --expect 2
+   ```
+   通过：`SMOKE-9 PASS`、`SMOKE-10 PASS`。
+5. **C 臂全量**：`libero_goal` 优先，4 个 suite 各一条（可并行，多个客户端共享两个服务）：
+   ```bash
+   python -u -m examples.libero_r1.eval_r1 --arm va_oracle --suite <suite>
+   ```
+6. **A 臂全量**：
+   ```bash
+   python -u -m examples.libero_r1.eval_r1 --arm va_random --suite <suite>
+   ```
+7. **附加检查（规格 8.8，不阻塞主流程）**：只需 VLA 服务。
+   ```bash
+   python -u -m examples.libero_r1.eval_r1 --arm vla --suite libero_goal --tasks 0 3 7 --max_steps_override 800 --run_name vla_cap800
+   python -u -m examples.libero_r1.eval_r1 --arm vla --suite libero_10   --tasks 8     --max_steps_override 800 --run_name vla_cap800
+   ```
+   输出在 `results/R1/R1C/vla_cap800/<suite>/`，字段与 D 臂相同；`run_meta_*.json` 记录 `max_steps: 800`。
+8. **汇总与打包**：`python -m examples.libero_r1.summarize_r1`（含附加检查表 `extra_vla_cap800.csv`），然后按第 6 节打包。
+
+## 5. 按第 6 节顺序执行（历史记录：首次执行用，冒烟 11 以 5A 为准）
 1. D 臂冒烟（冒烟 5，≥5/6）：
    `python -m examples.libero_r1.eval_r1 --arm vla --suite libero_goal --task_end 2 --episodes_per_task 3 --out_root results/R1/smoke --run_name D`
    D 臂全量：对 4 个 suite 各跑 `python -m examples.libero_r1.eval_r1 --arm vla --suite <suite>`（可并行，多个客户端可共享同一服务）。
 2. R1-D 冒烟（冒烟 3、4）：VA 服务改用 smoke 检查点启动，然后
    `python -m examples.libero_r1.diag_r1d --va_ckpts $PWD/checkpoints/APT/va_libero4_r1_smoke/ckpt_0000200.pt --suites libero_goal --tasks 0 --states 0 --out_dir results/R1/smoke/R1D --vis_all`
    通过：一行 CSV + 一张图；人工看图，白黑小圆点（起点）落在夹爪上。
-   冒烟 11（规格第 7 节裁决 2，紧接 R1-D 冒烟，VA 服务仍是 smoke 检查点）：
-   `python -m examples.libero_r1.check_sampling --uri va --smoke11`
-   通过：`[SMOKE-11] ... -> PASS`（真实指令与 `do nothing` 的 32 条轨迹位置逐元素最大差值 ≤ 1e-4 米）。不通过：停止，回传完整输出，不要继续。
-   之后把 VA 服务换回 40k 检查点（第 4 节命令）。
+   冒烟 11：已由规格第 8 节改为 token 数对齐的判据并在 40k 上执行，见 5A 第 1 步。
    R1-D 全量：`python -m examples.libero_r1.diag_r1d --va_ckpts $PWD/checkpoints/APT/va_libero4_r1/ckpt_00{1,2,3,4}0000.pt --out_dir results/R1/R1D`
 3. C 臂冒烟（冒烟 6，≥3/6，VA 用 40k）：
    `python -m examples.libero_r1.eval_r1 --arm va_oracle --suite libero_goal --task_end 2 --episodes_per_task 3 --out_root results/R1/smoke --run_name C`
@@ -97,4 +142,14 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 6. 聚类合并条件：距离 ≤ 阈值；最大步数判定 `t >= 上限`，A、C、D 三臂一致。
 7. 冒烟 2：第 181–200 步 `total_loss` 均值低于第 1–20 步均值；正式 CSV 每 1000 步一行，值为前 100 步均值。
 8. 冒烟 9、10 在 C 臂冒烟之后、C 臂全量之前；冒烟 11 在 R1-D 冒烟之后。
+
+## 9. 已裁决事项（规格第 8 节，优先于第 7 节和正文）
+1. 冒烟 11 判定通过、VA 无语言泄漏（token 数对齐时 VA 逐位相同，VLA 差 129–150 mm）。
+2. 冒烟 11 新判据：对照补到相同 token 数；VA 位置最大差 ≤ 1e-4 m；VLA 阳性对照 > 0.01 m（`check_sampling --smoke11`，两个服务各跑一次）。
+3. 冒烟 11 在 40k 上重跑一次，排在 R1-D 全量之前；VA 侧失败则停止上报。
+4. 检查 [3] 的 WARN 不视为 bug；正式运行统一用共享骨干；可复现性由冒烟 9 保证。
+5. 所有臂、所有 episode 用同一套推理配置（共享骨干、bf16、K=32），中途改变则受影响 suite 整体重跑。
+6. D 臂 91.75% 接受为参照系，不重跑。
+7. 恢复执行顺序见 5A。
+8. 附加检查：D 臂在 `libero_goal` 任务 0、3、7 与 `libero_10` 任务 8 各 50 个 episode，上限 800 步，输出 `results/R1/R1C/vla_cap800/`。
 

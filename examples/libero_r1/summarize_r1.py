@@ -17,7 +17,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from .libero_common import SUITES
+from .libero_common import MAX_STEPS, SUITES
 from .traj_select import wilson_interval
 
 ARMS = ["vla", "va_oracle", "va_random"]
@@ -251,12 +251,39 @@ def summarize_r1d(args, md, flags):
               + md_table(out, list(out[0].keys())) + "\n")
 
 
+def summarize_cap800(args, md):
+    """Spec 8.8 extra check: D arm with a raised step cap vs the main D arm, same tasks."""
+    cap = load_episodes(args.r1c_root, args.cap_run)
+    if not cap:
+        return
+    base = load_episodes(args.r1c_root, "vla")
+    rows = []
+    for s in SUITES:
+        for t in sorted({int(r["task_id"]) for r in cap.get(s, [])}):
+            c = [r for r in cap[s] if int(r["task_id"]) == t]
+            d = [r for r in base.get(s, []) if int(r["task_id"]) == t]
+            c_succ = [int(r["steps"]) for r in c if int(r["success"])]
+            rows.append(dict(
+                suite=s, task_id=t, orig_cap=MAX_STEPS[s],
+                D_rate=round(np.mean([int(r["success"]) for r in d]), 4) if d else "", n_D=len(d),
+                cap_rate=round(np.mean([int(r["success"]) for r in c]), 4), n_cap=len(c),
+                cap_successes_beyond_orig_cap=sum(st > MAX_STEPS[s] for st in c_succ),
+                cap_median_steps_success=int(np.median(c_succ)) if c_succ else "",
+                cap_failures_hitting_cap=sum(1 for r in c if not int(r["success"])),
+            ))
+    write_csv(os.path.join(args.out_dir, "extra_vla_cap800.csv"), rows)
+    md.append(f"## 附加检查（规格 8.8）：D 臂提高步数上限（{args.cap_run}）\n\n"
+              "`cap_successes_beyond_orig_cap` = 在原上限之后才成功的 episode 数；失败 episode 都跑满了新上限。\n\n"
+              + md_table(rows, list(rows[0].keys())) + "\n")
+
+
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     md, flags = ["# R1 第一阶段汇总\n"], []
     body = []
     summarize_r1d(args, body, flags)
     summarize_r1c(args, body, flags)
+    summarize_cap800(args, body)
     md.append("## 异常（规格第 1 节）\n")
     md.append("\n".join("- " + f for f in flags) + "\n" if flags else "未触发任何异常条件。\n")
     md += body
@@ -270,4 +297,5 @@ if __name__ == "__main__":
     p.add_argument("--r1c_root", default="results/R1/R1C")
     p.add_argument("--r1d_csv", default="results/R1/R1D/r1d_rows.csv")
     p.add_argument("--out_dir", default="results/R1/summary")
+    p.add_argument("--cap_run", default="vla_cap800", help="run_name of the spec 8.8 extra D-arm check")
     main(p.parse_args())
