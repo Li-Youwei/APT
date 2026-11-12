@@ -1,7 +1,7 @@
 import os
 import json
 from typing import List, Dict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 
 from data_utils import datasets
 from data_utils.dataset_base import H5DatasetMapBase
@@ -213,3 +213,9 @@ CONFIGS["r1_va_libero4"] = TrainConfig(
     robot_pose_aug=False,
     seed=0,
 )
+
+# R1b (spec section 12.3): identical to r1_va_libero4 except 60k iterations; trained on the
+# re-converted data that carries ee_pose_desired / gripper_desired (point APT_DATA_LOC at it).
+# Save name: va_libero4_r1b.
+CONFIGS["r1b_va_libero4"] = replace(CONFIGS["r1_va_libero4"], max_iterations=int(60e3))
+

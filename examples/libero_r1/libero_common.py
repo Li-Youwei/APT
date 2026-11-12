@@ -134,3 +134,63 @@ def step_with_pose(env, obs, target_pose: np.ndarray, target_grip: float):
     )
     obs, _r, done, _info = env.step(action.tolist())
     return obs, bool(done)
+
+
+# ── commanded (desired) EE targets of robosuite's OSC_POSE controller (spec 12.2 / 12.3) ──
+#
+# robosuite v1.4.1 OSC.set_goal (verified against the source, see codex_instructions):
+#   a = clip(action[:6], input_min, input_max); delta = a * action_scale (+ output transform, 0 here)
+#   goal_pos = ee_pos + delta[:3]                (ee_pos = grip-site position, same as obs robot0_eef_pos)
+#   goal_ori = R(delta[3:6]) @ ee_ori_mat        (ee_ori_mat = grip-SITE orientation), but goal_ori is
+#              only updated when some rotation component is non-zero; otherwise the previous goal is kept
+#   (position / orientation limits clip the goal when configured; None in LIBERO by default)
+# Our EE pose uses obs robot0_eef_quat, the hand BODY orientation, which differs from the site by a
+# constant rotation C = R_site^T R_body; a goal in our convention is goal_ori_site @ C.
+
+
+def controller_info(env) -> dict:
+    ctrl = env.env.robots[0].controller
+
+    def arr(x):
+        return None if x is None else np.asarray(x, dtype=float).tolist()
+
+    scale = ctrl.action_scale
+    if scale is None:  # robosuite computes it lazily on the first scale_action call
+        scale = np.abs(np.asarray(ctrl.output_max) - np.asarray(ctrl.output_min)) / \
+            np.abs(np.asarray(ctrl.input_max) - np.asarray(ctrl.input_min))
+    return dict(
+        controller=type(ctrl).__name__, eef_site=getattr(ctrl, "eef_name", None),
+        input_min=arr(ctrl.input_min), input_max=arr(ctrl.input_max),
+        output_min=arr(ctrl.output_min), output_max=arr(ctrl.output_max), action_scale=arr(scale),
+        use_delta=bool(getattr(ctrl, "use_delta", True)), use_ori=bool(getattr(ctrl, "use_ori", True)),
+        position_limits=arr(getattr(ctrl, "position_limits", None)),
+        orientation_limits=arr(getattr(ctrl, "orientation_limits", None)),
+        interpolator=None if getattr(ctrl, "interpolator_pos", None) is None else type(ctrl.interpolator_pos).__name__,
+        control_freq=float(getattr(env.env, "control_freq", float("nan"))),
+    )
+
+
+def site_to_body_offset(env, obs) -> np.ndarray:
+    """C = R_site^T @ R_body for the controller's EE site and the obs EE body orientation."""
+    import robosuite.utils.transform_utils as T
+    ctrl = env.env.robots[0].controller
+    sid = env.sim.model.site_name2id(ctrl.eef_name)
+    R_site = np.asarray(env.sim.data.site_xmat[sid]).reshape(3, 3)
+    return R_site.T @ T.quat2mat(obs["robot0_eef_quat"])
+
+
+def commanded_target_formula(ee_pose: np.ndarray, action: np.ndarray, info: dict, prev_goal_rot=None):
+    """Spec 12.2 formula with the controller's clipping and 'hold orientation on zero rotation'
+    rule. ee_pose (4,4) in our convention (site position, body orientation). Returns (T_goal (4,4),
+    gripper target in [0,1] with 1 = open)."""
+    from scipy.spatial.transform import Rotation as R
+    a = np.clip(np.asarray(action[:6], float), info["input_min"], info["input_max"])
+    delta = a * np.asarray(info["action_scale"], float)
+    goal = np.eye(4)
+    goal[:3, 3] = ee_pose[:3, 3] + delta[:3]
+    if np.any(~np.isclose(delta[3:6], 0.0)) or prev_goal_rot is None:
+        goal[:3, :3] = R.from_rotvec(delta[3:6]).as_matrix() @ ee_pose[:3, :3]
+    else:
+        goal[:3, :3] = prev_goal_rot
+    grip = float((1.0 - np.clip(action[6], -1.0, 1.0)) / 2.0)   # -1 (open) -> 1, +1 (close) -> 0
+    return goal, grip

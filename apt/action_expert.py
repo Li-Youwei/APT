@@ -623,6 +623,8 @@ class ActionExpert(nn.Module):
         camera_drop_prob: Optional[Tensor] = None,
         initial_noise: Optional[Tensor] = None,
         train_timesteps: Optional[Tensor] = None,
+        random_frame_rotation: Optional[bool] = None,
+        return_x0: bool = False,
     ):
         """
         Args:
@@ -665,6 +667,12 @@ class ActionExpert(nn.Module):
             train_timesteps: (B,) or None. Training-loss branch only: fixed
                 diffusion timesteps instead of uniform random ones (used by
                 the R1-X per-timestep loss diagnostic). None = old behaviour.
+            random_frame_rotation: None = old behaviour (random rotation of the
+                mean-pose frame in the training branch, none at inference);
+                True / False forces it on / off in either branch (R1-Y Y2).
+            return_x0: training branch only. Also return the clean trajectory
+                reconstructed from the noise prediction, as world-frame states
+                (B, Ta, Nee, 17) (R1-Y Y3). Requires epsilon prediction.
         
         Returns
         -------
@@ -677,7 +685,10 @@ class ActionExpert(nn.Module):
             metrics (Dict[str, Tensor]): metrics for logging
         """
         # compute average pose
-        avg_pose = compute_mean_pose(vl_outputs, inference=inference)  # (B, 4, 4)
+        avg_pose = compute_mean_pose(
+            vl_outputs,
+            inference=inference if random_frame_rotation is None else (not random_frame_rotation),
+        )  # (B, 4, 4)
         avg_pose_inv = torch.inverse(avg_pose)  # (B, 4, 4)
 
         # apply avg pose distraction to all pose-related inputs
@@ -827,6 +838,19 @@ class ActionExpert(nn.Module):
 
         # one step denoising
         pred = self.dp_head(timesteps, noisy_trajectory, **fixed_inputs)
+
+        x0_states = None
+        if return_x0:
+            assert self.noise_scheduler.config.prediction_type == "epsilon"
+            a_bar = self.noise_scheduler.alphas_cumprod.to(pred.device, torch.float32)[timesteps]
+            a_bar = a_bar.view(B, 1, 1, 1)
+            x0 = (noisy_trajectory.float() - (1 - a_bar).sqrt() * pred[..., :self.act_dim].float()) / a_bar.sqrt()
+            x0_states = action2states(action_ref_pose, current_ee_pose, x0)  # (B, Nee, Ta, 17), mean-pose frame
+            x0_states[..., :16] = (
+                avg_pose.unsqueeze(1).unsqueeze(1) @
+                x0_states[..., :16].reshape(*x0_states.shape[:-1], 4, 4)
+            ).view(*x0_states.shape[:-1], 16)
+            x0_states = x0_states.transpose(1, 2).contiguous()  # (B, Ta, Nee, 17)
         target = get_target(gt_future_action, noise, timesteps, self.noise_scheduler)
 
         # only calculate errors on valid_ee_indices
@@ -845,6 +869,8 @@ class ActionExpert(nn.Module):
             "openness_loss": openness_loss.item(),
             "total_loss": total_loss.item()
         }
+        if return_x0:
+            return total_loss, metrics, x0_states
         return total_loss, metrics
 
 

@@ -59,7 +59,93 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
 
 > 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
-## 5B. 2026-11-12 诊断实验 R1-X（规格第 9 节）—— 现在从这里开始
+## 5C. R1-Y 验证与 VA 重训（规格第 12 节）—— 现在从这里开始
+
+C 臂全量、A 臂全量、800 步附加检查继续暂停。约定：`RAW=<LIBERO 仓库>/libero/datasets`（官方示教原始文件所在目录，与第 2 节转换时的 `--raw_root` 相同）。0–4 步只做推理，不训练。
+每一步的完整输出都用 `2>&1 | tee results/R1/R1Y/<步骤名>.log` 保存。
+
+0. `git pull`（分支 `r1-phase1`），`mkdir -p results/R1/R1Y`。本节不需要推理服务。
+1. **控制器配置与指令目标公式核对**（LIBERO 环境）：
+   ```bash
+   python -u -m examples.libero_r1.controller_probe --raw_root $RAW --out results/R1/R1Y/controller_config.json
+   ```
+   回报 `controller` 中的 `output_max/output_min/action_scale`（预期位置 0.05 m、姿态 0.5 rad）、`position_limits/orientation_limits`，以及公式与控制器实际目标的差（`formula_vs_controller_*`，预期位置 < 1e-6 m）。这一步不判停，但数值必须回传。
+2. **Y1**（APT 环境，GPU）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1y y1 --raw_root $RAW \
+     --controller_json results/R1/R1Y/controller_config.json --out_dir results/R1/R1Y
+   ```
+   判定行：`[Y1-VERDICT] ... -> A HOLDS / A NOT CONFIRMED`（第 1 步误差中位数 < 1 cm）。
+3. **Y2**：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1y y2 \
+     --va checkpoints/APT/va_libero4_r1/ckpt_0040000.pt --out_dir results/R1/R1Y
+   ```
+   判定行：`[Y2-VERDICT] ... -> ROTATION MISMATCH (stop, report) / not triggered`。
+4. **Y3**：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1y y3 --raw_root $RAW \
+     --controller_json results/R1/R1Y/controller_config.json --out_dir results/R1/R1Y \
+     --models va10k=checkpoints/APT/va_libero4_r1/ckpt_0010000.pt va20k=checkpoints/APT/va_libero4_r1/ckpt_0020000.pt \
+              va30k=checkpoints/APT/va_libero4_r1/ckpt_0030000.pt va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
+              vla=checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt
+   ```
+   不判停，输出 `y3_summary.json`（各档由噪声预测反推的干净轨迹的位置误差，米）。
+5. **是否进入重训（规格 12.3 执行条件）**：只有 Y1 为 `A HOLDS` 且 Y2 为 `not triggered` 才继续第 6 步，不需要再等研究侧通知；否则停止，打包 `results/R1/R1Y` 回传。
+6. **重新转换四个 suite**（LIBERO 环境，新目录，旧数据保留）：
+   ```bash
+   for s in libero_spatial libero_object libero_goal libero_10; do
+     python -u -m examples.libero_r1.convert_libero --raw_root $RAW --out_root /data/libero_apt_r1b --suites $s --write_desired \
+       > results/R1/R1Y/convert_r1b_$s.log 2>&1 &
+   done; wait
+   mkdir -p results/R1/R1Tb/data_stats && cp /data/libero_apt_r1b/*_stats.json results/R1/R1Tb/data_stats/
+   ```
+   回报每个 suite 的保留与丢弃 episode 数（应与旧数据相同：共 1702 / 2000），以及 `desired_check`（公式与控制器的差、指令目标领先实际位置的中位数和 95 分位）。`/data/libero_apt_r1b` 换成实际磁盘位置即可。
+7. **登记新数据并检查**（APT 环境）：
+   ```bash
+   python -m examples.libero_r1.make_data_loc --root /data/libero_apt_r1b --host r1 --out data_utils/data_loc.r1b.local.yaml
+   export APT_DATA_LOC=$PWD/data_utils/data_loc.r1b.local.yaml APT_DATA_LOC_HOST=r1
+   python -m examples.libero_r1.check_data
+   ```
+   **之后所有训练和数据相关命令都必须在设置了这个 `APT_DATA_LOC` 的 shell 中执行。** 推理服务不读数据，两套 YAML 都可以。
+8. **数据检查（规格 12.3 第 2 条）**：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1y datacheck --out_dir results/R1/R1Y/datacheck
+   ```
+   必须输出 `[DATACHECK] ... -> PASS`（VLA 对新数据真值第 1 步误差中位数 < 1 cm 且夹爪平均绝对差中位数 < 0.1），否则停止并回传。
+9. **重训**（规格 12.3 第 3 条：与 2.1 相同，只改 60000 步和保存名）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 -m apt.train --backend ddp --config r1b_va_libero4 -s va_libero4_r1b \
+     --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt 2>&1 | tee results/R1/R1Y/train_r1b.log
+   python -m examples.libero_r1.r1t_report --log_dir logs/APT/va_libero4_r1b --ckpt_dir checkpoints/APT/va_libero4_r1b --out_dir results/R1/R1Tb
+   ```
+   显存不足时同 2.1 的降批量方案并注明。得到 `ckpt_00{1..6}0000.pt`。
+10. **训练后检查与选检查点（规格 12.3 第 4 条）**：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1y posttrain --out_dir results/R1/R1Y/posttrain \
+     --models va40k=checkpoints/APT/va_libero4_r1b/ckpt_0040000.pt va60k=checkpoints/APT/va_libero4_r1b/ckpt_0060000.pt
+   ```
+   通过判据：相邻步位移中位数 ≤ 1.5 cm 且 8 条中最优者的位置误差中位数 ≤ 4 cm；60k 优先，否则 40k。选中的路径写在 `results/R1/R1Y/posttrain/selected_ckpt.txt`；输出 `[POSTTRAIN-SELECT] no checkpoint passes` 时停止并回传（含各档误差）。
+11. **归档旧 VA 的结果**：
+    ```bash
+    mkdir -p results/R1/archive_actual_pose
+    mv results/R1/R1D results/R1/archive_actual_pose/R1D
+    mv results/R1/smoke/C results/R1/archive_actual_pose/smoke_C
+    ```
+12. **恢复第一阶段（规格 12.3 第 5 条）**：`VA_CKPT=$(cat results/R1/R1Y/posttrain/selected_ckpt.txt)`，按 5A 的顺序执行，所有写“40k 检查点”的地方改用 `$VA_CKPT`：
+    1. 用 `$VA_CKPT` 重启 VA 服务（VLA 服务不变）。
+    2. 冒烟 11（VA 与 VLA 两侧）。
+    3. R1-D 全量：`--va_ckpts` 用 `va_libero4_r1b` 的 10k、20k、30k、40k（规格 2.2 原文是四个检查点）；若选中的是 60k，再追加 60k，并加 `--vis_iters 60000`。
+    4. C 臂冒烟。
+    5. 冒烟 9、10（输出目录先清理旧的 `results/R1/smoke/A_rep*` 与 `resume`）。
+    6. C 臂全量。
+    7. A 臂全量。
+    8. 800 步附加检查（D 臂结果与 VLA 无关，照常）。
+    9. 汇总打包。
+
+回传：`results/R1/R1Y/`、`results/R1/R1Tb/`、各步日志、`git rev-parse HEAD`。
+
+## 5B. 2026-11-12 诊断实验 R1-X（规格第 9 节）（已完成）
 
 规格 9.1：C 臂全量、A 臂全量、800 步附加检查全部暂停；R1-D 结果作废（保留文件但不再使用）。5A 第 2 步之后的内容暂停，等研究侧根据 R1-X 结果另行通知。R1-X 只做推理，不训练，不改权重。
 
@@ -228,4 +314,19 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 1. X2 冒烟第 3 条改为：VLA 平均位置误差中位数 ≤ 4 cm，且预测/真值净位移中位数之比 0.7–1.4；冒烟记为通过，不重跑。
 2. 放行 X2 全量和 X2b（5B 第 5、6 步）。
 3. X2 和 X2b 新增记录：第 1、2、4、8、16、32 步位置误差中位数（VA 取 8 条中平均误差最小的那条）；夹爪开合度平均绝对差中位数，以及真值、预测各自的均值。净位移统一从查询时末端位置量起。
+
+## 13. 规格第 12 节要点
+1. 推断 A（VLA 学的是控制器指令目标）基本成立；VA 更可能是在低噪声段没学好；未微调的 `apt_va` 在 LIBERO 上的表现不作判读。
+2. R1-Y：Y1 用原始动作重建指令目标与 VLA 对比；Y2 比较旋转增强开和关；Y3 给出由噪声预测反推的位置误差分档表（5C 第 1–4 步）。
+3. Y1 成立且 Y2 未触发时，直接重新转换（写入 `ee_pose_desired` / `gripper_desired`）→ 数据检查 → 重训 60k（`va_libero4_r1b`）→ 按 40k/60k 判据选检查点 → 恢复第一阶段（5C 第 5–12 步）。
+4. 指令目标按控制器的实际实现计算（见下节），结果中报告控制器配置的实际值。
+
+## 14. 指令目标：规格 12.2 写法与 robosuite v1.4.1 OSC 实际实现的差异
+按控制器实际实现处理（`examples/libero_r1/libero_common.py` 中 `commanded_target_formula`；转换时直接读取控制器的目标）：
+1. **动作先裁剪到输入范围 [-1, 1]，再乘缩放系数**（规格写法没有裁剪）。
+2. **姿态目标只在旋转分量不全为 0 时才更新**；三个旋转分量都为 0 时，控制器沿用上一步的姿态目标，而不是“当前姿态”。
+3. **控制器的姿态目标是夹爪 site 的姿态**，我们的末端姿态取自 hand body（`robot0_eef_quat`），两者相差一个固定旋转。左乘的旋转增量与这个固定旋转无关；转换时用每帧实测的 site→body 偏移换算，并报告其漂移。位置两者是同一个点（grip site），无差异。
+4. 位置/姿态限位（`position_limits` / `orientation_limits`）在配置了时会裁剪目标，LIBERO 默认未配置，以 `controller_config.json` 的实际值为准。
+5. 夹爪目标按规格：动作第 7 维 −1 → 1（张开），+1 → 0（闭合），中间值线性映射为 (1 − a)/2。
+转换脚本 `--write_desired` 写入的是控制器实际目标（`controller.goal_pos` / `goal_ori`），同时计算规格公式（含上面第 1、2 条）并在 `desired_check` 中报告二者之差；Y1 / Y3 中 VLA 的“指令目标真值”无法读控制器（旧数据），用的是含第 1、2 条的公式，每个 episode 开头若第一个动作没有旋转分量，以当前姿态代替控制器复位时的姿态目标（只影响姿态，不影响 Y1 的位置判据）。
 
