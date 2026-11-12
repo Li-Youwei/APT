@@ -280,3 +280,31 @@ def r1d_analyse(pos, grip, ref_pos, ref_grip):
         vla_cluster_rank=rank0 + 1,
         vla_cluster_share=round(clusters[rank0].size / n, 6),
     ), cand
+
+
+# ── R1-X motion statistics (spec 9.2) ───────────────────────────────────────
+
+def motion_stats(pos: np.ndarray, grip: np.ndarray, cur_pos: Optional[np.ndarray] = None) -> dict:
+    """Smoothness statistics of K trajectories, all in metres.
+
+    pos (K, T, 3), grip (K, T), cur_pos (3,) = EE position at query time.
+      adj_disp_median / adj_disp_p95 : over all K x (T-1) steps |p[t+1] - p[t]|
+      adj_disp_max                   : max of the same
+      net_disp_median                : median over K of |p[T-1] - cur_pos| ("32-step net
+                                       displacement"; falls back to |p[T-1] - p[0]|
+                                       when cur_pos is None)
+      net_disp_first_last_median     : median over K of |p[T-1] - p[0]|
+      grip_std_median                : median over K of std_t(grip)
+    """
+    pos = np.asarray(pos, np.float64)
+    adj = np.linalg.norm(np.diff(pos, axis=1), axis=-1).ravel()
+    fl = np.linalg.norm(pos[:, -1] - pos[:, 0], axis=-1)
+    net = fl if cur_pos is None else np.linalg.norm(pos[:, -1] - np.asarray(cur_pos, np.float64)[None], axis=-1)
+    return dict(
+        adj_disp_median=float(np.median(adj)),
+        adj_disp_p95=float(np.percentile(adj, 95)),
+        adj_disp_max=float(adj.max()),
+        net_disp_median=float(np.median(net)),
+        net_disp_first_last_median=float(np.median(fl)),
+        grip_std_median=float(np.median(np.std(np.asarray(grip, np.float64), axis=1))),
+    )

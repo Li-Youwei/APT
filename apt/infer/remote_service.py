@@ -73,6 +73,10 @@ class Service(TrajPlanner):
         return super().sample_trajs(obs_frames, prompt_text, noise, config, share_vlm, ref_cam)
 
     @expose()
+    def sample_trajs_legacy(self, obs_frames, prompt_text, sample_num, seed, config="Libero", ref_cam=None):
+        return super().sample_trajs_legacy(obs_frames, prompt_text, sample_num, seed, config, ref_cam)
+
+    @expose()
     def load_weights(self, ckpt_path):
         return super().load_weights(ckpt_path)
 

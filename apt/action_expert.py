@@ -622,6 +622,7 @@ class ActionExpert(nn.Module):
         robot_pose_aug: bool = False,
         camera_drop_prob: Optional[Tensor] = None,
         initial_noise: Optional[Tensor] = None,
+        train_timesteps: Optional[Tensor] = None,
     ):
         """
         Args:
@@ -661,6 +662,9 @@ class ActionExpert(nn.Module):
             initial_noise: (B, Nee, Ta, act_dim) or None. Inference only: the
                 starting noise of the DDIM chain. None keeps the previous
                 behaviour (drawn with torch.randn on the default generator).
+            train_timesteps: (B,) or None. Training-loss branch only: fixed
+                diffusion timesteps instead of uniform random ones (used by
+                the R1-X per-timestep loss diagnostic). None = old behaviour.
         
         Returns
         -------
@@ -804,12 +808,16 @@ class ActionExpert(nn.Module):
                             device=gt_future_ee_states.device)
 
         # sample a random timestep
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            size=(B,), 
-            device=noise.device
-        )
+        if train_timesteps is None:
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                size=(B,), 
+                device=noise.device
+            )
+        else:
+            timesteps = train_timesteps.to(device=noise.device, dtype=torch.long)
+            assert timesteps.shape == (B,), (timesteps.shape, B)
 
         # add noise to the clean trajectory
         noisy_trajectory = self.noise_scheduler.add_noise(

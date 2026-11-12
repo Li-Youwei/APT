@@ -597,3 +597,50 @@ class TrajPlanner(object):
             "seq_len": seq_len,
         }
 
+    def sample_trajs_legacy(
+        self,
+        obs_frames: Union[dict, List[dict]],
+        prompt_text: str,
+        sample_num: int,
+        seed: int,
+        config: Union[str, dict, DataConfig] = "Libero",
+        ref_cam: Union[str, None] = None,
+    ) -> Dict[str, np.ndarray]:
+        """R1-X X1 control path: the repository's ORIGINAL `get_action(sample_num=K)`
+        (observation replicated K times, `VLA.forward`, noise from torch's default
+        generator), with only the seed and the reference camera pinned. Server
+        state (config, prompt, frame buffer) is restored afterwards."""
+        import time as _time
+        if isinstance(obs_frames, dict):
+            obs_frames = [obs_frames]
+        with self.sample_lock:
+            saved = (self.config, getattr(self, "prompt_text", None), list(self.obs_frames))
+            try:
+                self.set_config(config)
+                if ref_cam is not None:
+                    for ee in self.config.ee_indices:
+                        cands = self.config.ee_ref_cams[ee]
+                        cands = (cands,) if isinstance(cands, str) else tuple(cands)
+                        assert ref_cam in cands, "ref_cam {!r} not in {}".format(ref_cam, cands)
+                    self.config.ee_ref_cams = {ee: ref_cam for ee in self.config.ee_indices}
+                self.prompt_text = prompt_text
+                with self.obs_lock:
+                    self.obs_frames = list(obs_frames)
+                torch.manual_seed(int(seed))
+                t0 = _time.perf_counter()
+                poses, grips, _t, _img = TrajPlanner.get_action(self, sample_num=int(sample_num))
+                if self.device.startswith("cuda"):
+                    torch.cuda.synchronize(self.device)
+                infer_time = _time.perf_counter() - t0
+                ee = self.config.ee_indices[0]
+            finally:
+                self.config, self.prompt_text = saved[0], saved[1]
+                with self.obs_lock:
+                    self.obs_frames = saved[2]
+        return {
+            "ee_pose": np.asarray(poses[:, :, ee], np.float32),   # (K, Ta, 4, 4)
+            "gripper": np.asarray(grips[:, :, ee], np.float32),   # (K, Ta)
+            "infer_time_s": float(infer_time),
+            "ref_cam": ref_cam,
+        }
+

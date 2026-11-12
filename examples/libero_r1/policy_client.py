@@ -73,3 +73,15 @@ class Policy:
             "ref_cam": ref_cam,
             "seq_len": out.get("seq_len"),
         }
+
+    def sample_legacy(self, frame: dict, prompt: str, K: int, seed: int, ref_cam: str) -> dict:
+        """R1-X only: the repository's original get_action(sample_num=K) path on the
+        server (torch noise seeded with `seed`, reference camera pinned)."""
+        assert ref_cam in REF_CAMS, ref_cam
+        t0 = time.perf_counter()
+        out = self.proxy.sample_trajs_legacy(frame, prompt, int(K), int(seed), DATA_CONFIG, ref_cam)
+        rpc_time = time.perf_counter() - t0
+        poses = np.asarray(out["ee_pose"], np.float64)
+        return {"poses": poses, "pos": poses[..., :3, 3], "grip": np.asarray(out["gripper"], np.float64),
+                "infer_time_s": float(out["infer_time_s"]), "rpc_time_s": rpc_time, "ref_cam": ref_cam}
+

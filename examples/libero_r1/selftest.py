@@ -154,9 +154,21 @@ def test_r1d_analyse():
     assert st2["covered"] == 0 and abs(st2["min_dist_to_vla"] - 0.2) < 1e-9
 
 
+def test_motion_stats():
+    p, g = _traj([0, 0, 0], [0.005, 0, 0])
+    st = TS.motion_stats(p[None], g[None], cur_pos=np.zeros(3))
+    assert abs(st["adj_disp_median"] - 0.005) < 1e-12 and abs(st["adj_disp_p95"] - 0.005) < 1e-12
+    assert abs(st["net_disp_median"] - 0.16) < 1e-12 and abs(st["net_disp_first_last_median"] - 0.155) < 1e-12
+    assert st["grip_std_median"] == 0.0
+    # jitter: alternating +-2 cm around a point -> large adjacent steps, ~0 net displacement
+    j = np.zeros((1, 32, 3)); j[0, ::2, 0] = 0.02
+    st = TS.motion_stats(j, np.ones((1, 32)), cur_pos=np.zeros(3))
+    assert abs(st["adj_disp_median"] - 0.02) < 1e-12 and st["net_disp_median"] < 1e-12
+
+
 def main():
     for f in (test_distance, test_linkage_simple, test_linkage_vs_scipy, test_candidates_and_selectors,
-              test_misc, test_r1d_analyse):
+              test_misc, test_r1d_analyse, test_motion_stats):
         f()
         print(f"[PASS] {f.__name__}")
     print("ALL SELFTESTS PASSED")

@@ -59,7 +59,51 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
 
 > 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
-## 5A. 2026-11-12 恢复执行（规格第 8 节第 7 条）—— 现在从这里开始
+## 5B. 2026-11-12 诊断实验 R1-X（规格第 9 节）—— 现在从这里开始
+
+规格 9.1：C 臂全量、A 臂全量、800 步附加检查全部暂停；R1-D 结果作废（保留文件但不再使用）。5A 第 2 步之后的内容暂停，等研究侧根据 R1-X 结果另行通知。R1-X 只做推理，不训练，不改权重。
+
+0. `git pull`（分支 `r1-phase1`），重启 pyro4-ns、VLA 服务（GPU1）和 VA 服务（GPU0，用 40k 启动即可，脚本会在 `apt_va`、10k、40k 之间热切换）。服务端代码有新增方法（`sample_trajs_legacy`），必须重启。先建输出目录：`mkdir -p results/R1/R1X/smoke`。
+1. **X1 冒烟（规格 9.4 第 1、2 条）**，LIBERO 环境：
+   ```bash
+   python -u -m examples.libero_r1.diag_r1x --tasks 0 --ref_cams agentview --out_dir results/R1/R1X/smoke 2>&1 | tee results/R1/R1X/smoke_x1.log
+   ```
+   通过：`results/R1/R1X/smoke/x1_rows.csv` 有 2 行（VLA × 共享骨干 / 复制观测），并输出 `[X1-SMOKE-2] ... -> PASS`（VLA 相邻步位移中位数 ≤ 1 cm）。不通过：停止并回传。
+2. **X1 全量**（4 模型 × 2 路径 × 2 相机 × 10 状态 = 160 行）：
+   ```bash
+   python -u -m examples.libero_r1.diag_r1x \
+     --va_ckpts apt_va=$PWD/checkpoints/hf/apt_va/ckpt_latest.pt \
+                va10k=$PWD/checkpoints/APT/va_libero4_r1/ckpt_0010000.pt \
+                va40k=$PWD/checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
+     --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x1.log
+   ```
+   输出 `x1_rows.csv`、`x1_summary.csv`、`x1_vis/va40k_goal_t*.png`（10 张，白线为 VLA 参照）。可续跑。
+3. 停掉两个推理服务，释放 GPU。
+4. **X2 冒烟（规格 9.4 第 3 条）**，APT 环境（需 `APT_DATA_LOC_HOST=r1`）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1x_x2 \
+     --models vla=checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt \
+     --out_dir results/R1/R1X/smoke 2>&1 | tee results/R1/R1X/smoke_x2.log
+   ```
+   通过：`[X2-SMOKE-3] vla mean 32-step position error = … cm (<= 3 cm) -> PASS`。不通过：停止并回传（说明数据读取或转换与 VLA 训练数据不一致）。
+5. **X2 全量**：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1x_x2 \
+     --models vla=checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt \
+              apt_va=checkpoints/hf/apt_va/ckpt_latest.pt \
+              va40k=checkpoints/APT/va_libero4_r1/ckpt_0040000.pt \
+     --out_dir results/R1/R1X 2>&1 | tee results/R1/R1X/x2.log
+   ```
+   输出 `x2_gt.csv`（真值统计）、`x2_pred.csv`（逐样本预测误差与平滑度）、`x2_loss.csv`（逐样本 × 时间步档的 loss）、`x2_summary.json`。`x2_samples.pt` 是 200 个样本的缓存，不打包。
+6. **回传**：
+   ```bash
+   tar --exclude='*.pt' -czf R1X_results.tar.gz results/R1/R1X
+   ```
+   另附：两个服务的完整日志、`git rev-parse HEAD`、`nvidia-smi`。X3 的书面回答在仓库 `exp/R1_va_jev_libero/r1x_x3_answers.md`，不需要 Codex 处理。
+
+R1-X 只新增诊断入口（`sample_trajs_legacy`、`ActionExpert.forward` 的可选 `train_timesteps`），没有改变任何已有推理或训练路径的行为，满足规格 9 节“在未修改的代码上留证据”的要求。
+
+## 5A. 2026-11-12 恢复执行（规格第 8 节第 7 条）（第 2 步之后暂停，见 5B）
 
 已完成且保留、不重跑：R1-T、D 臂全量（平均 91.75%，规格 8.6 接受为参照系）、R1-D 冒烟（冒烟 3、4）。
 
@@ -152,4 +196,10 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 6. D 臂 91.75% 接受为参照系，不重跑。
 7. 恢复执行顺序见 5A。
 8. 附加检查：D 臂在 `libero_goal` 任务 0、3、7 与 `libero_10` 任务 8 各 50 个 episode，上限 800 步，输出 `results/R1/R1C/vla_cap800/`。
+
+## 10. 规格第 9 节要点
+1. C 臂冒烟 0/6 判定为待查的 bug 或训练失败，不是 VA 能力问题。
+2. C 臂全量、A 臂全量、800 步附加检查暂停；R1-D 结果作废，修复后整体重跑。
+3. 冒烟 4 记为通过（VLA 参照轨迹起点落在夹爪上）。
+4. 诊断实验 R1-X：X1 推理路径对照、X2 训练数据开环对照、X3 代码核对（书面回答见 `r1x_x3_answers.md`）。执行见 5B。
 
