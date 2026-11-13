@@ -59,7 +59,76 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
 
 > 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
-## 5C. R1-Y 验证与 VA 重训（规格第 12 节）—— 现在从这里开始
+## 5D. 诊断实验 R1-Z（规格第 13 节）—— 现在从这里开始
+
+C 臂、A 臂、R1-D 继续暂停。新数据（带指令目标）是今后唯一的训练数据。**本节所有命令都在设置了新数据 YAML 的 shell 中执行**（APT 环境）：
+```bash
+export APT_DATA_LOC=$PWD/data_utils/data_loc.r1b.local.yaml APT_DATA_LOC_HOST=r1
+mkdir -p results/R1/R1Z/smoke
+```
+只推理部分（13.2）占 GPU0，过拟合训练（13.3）占 GPU1，两边可并行。不需要推理服务。完整输出都用 `2>&1 | tee results/R1/R1Z/<步骤名>.log` 保存。先 `git pull`（分支 `r1-phase1`）。
+
+运行 Q 按规格第 14 节从预训练 VLA `apt_vla` 直接加载（`train_stage=1`，不走 `load_from_va`），先下载（约 5.1 GB；`apt_vla` 的 VLM 是全量微调过的，权重文件里带 `vlm_weights`）：
+```bash
+huggingface-cli download KechunXu1/apt_models --include "apt_vla/*" --local-dir checkpoints/hf
+python scripts/test_ckpt.py --ckpt checkpoints/hf/apt_vla/ckpt_latest.pt --train-stage 1 2>&1 | tee results/R1/R1Z/test_ckpt_apt_vla.log
+```
+`test_ckpt.py` 应输出 `[ OK ]` 并提示含 `vlm_weights`。
+
+**冒烟（规格 13.5）**
+1. Z1–Z4 各在 5 个样本上跑通（GPU0）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z suites --n_samples 5 --out_dir results/R1/R1Z/smoke 2>&1 | tee results/R1/R1Z/smoke_suites.log
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z timesteps --n_samples 5 --out_dir results/R1/R1Z/smoke 2>&1 | tee results/R1/R1Z/smoke_timesteps.log
+   ```
+   通过：两个命令退出码 0，`z_suites_rows.csv`（含 `raw` 与 `smooth7` 两种行）和 `z2_summary.json` 有记录；并输出 `[Z-SMOKE-2] ... -> PASS`（Goal 上 VLA 最优轨迹误差中位数 ≤ 3 cm）。
+2. P、Q 各训练 100 步（GPU1，依次执行；`--master_port` 必须与其他训练不同）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29511 -m apt.train --backend ddp --config overfit_s0_goal1 \
+     -s overfit_s0_goal1_smoke --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt \
+     --max_iterations 100 --save_interval 100 --save_latest_interval 100 2>&1 | tee results/R1/R1Z/smoke_train_P.log
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29512 -m apt.train --backend ddp --config overfit_s1_goal1 \
+     -s overfit_s1_goal1_smoke --pretrained_ckpt checkpoints/hf/apt_vla/ckpt_latest.pt \
+     --max_iterations 100 --save_interval 100 --save_latest_interval 100 2>&1 | tee results/R1/R1Z/smoke_train_Q.log
+   grep -n "Loaded VLM weights\|Loaded pretrained weights\|load_from_va" results/R1/R1Z/smoke_train_Q.log
+   ```
+   通过（规格 13.5 第 3 条按第 14 节修改）：两次都无报错跑完 100 步；日志开头 `num samples of LiberoGoalTask1` 为任务 1 保留的示教数（非 0）；Q 严格加载 `apt_vla` 成功——动作专家用严格模式加载（不匹配会直接报错退出），日志有 `Loaded pretrained weights from checkpoints/hf/apt_vla/ckpt_latest.pt` 和 `Loaded VLM weights from checkpoint (missing=…, unexpected=0)`，且没有 `load_from_va layer mapping` 行（说明没有走扩展流程）。
+   任一冒烟不通过：停止并回传。
+
+**正式运行**
+3. 只推理部分（GPU0，各 200 个样本）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z suites --out_dir results/R1/R1Z 2>&1 | tee results/R1/R1Z/suites.log
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z timesteps --out_dir results/R1/R1Z 2>&1 | tee results/R1/R1Z/timesteps.log
+   ```
+   `suites` 输出 Z1（Goal 上真值与 VLA 的参照值）、Z3（四个 suite 上 VA 与 VLA 的指标与聚类数）和 Z4（VA 平滑后重算的指标，`va_smooth7`），写入 `z_suites_summary.json` 和 `z_suites_rows.csv`；`timesteps` 输出 Z2，写入 `z2_summary.json`。VA 默认用 `va_libero4_r1b` 60k，VLA 用 `apt_vla_ftlibero`。
+4. 过拟合训练（GPU1，P、Q 依次执行；显存不足时两者都改为 `--bs 32 --gradient_accumulation_steps 2` 并注明）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29511 -m apt.train --backend ddp --config overfit_s0_goal1 \
+     -s overfit_s0_goal1 --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt 2>&1 | tee results/R1/R1Z/train_P.log
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29512 -m apt.train --backend ddp --config overfit_s1_goal1 \
+     -s overfit_s1_goal1 --pretrained_ckpt checkpoints/hf/apt_vla/ckpt_latest.pt 2>&1 | tee results/R1/R1Z/train_Q.log
+   python -m examples.libero_r1.r1t_report --log_dir logs/APT/overfit_s0_goal1 --ckpt_dir checkpoints/APT/overfit_s0_goal1 --out_dir results/R1/R1Z/train_P --every 100
+   python -m examples.libero_r1.r1t_report --log_dir logs/APT/overfit_s1_goal1 --ckpt_dir checkpoints/APT/overfit_s1_goal1 --out_dir results/R1/R1Z/train_Q --every 100
+   ```
+5. 过拟合训练后检查（任一空闲 GPU）：
+   ```bash
+   C=checkpoints/APT
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z overfit --out_dir results/R1/R1Z/overfit --models \
+     p2k=$C/overfit_s0_goal1/ckpt_0002000.pt p4k=$C/overfit_s0_goal1/ckpt_0004000.pt \
+     p6k=$C/overfit_s0_goal1/ckpt_0006000.pt p8k=$C/overfit_s0_goal1/ckpt_0008000.pt \
+     q2k=$C/overfit_s1_goal1/ckpt_0002000.pt q4k=$C/overfit_s1_goal1/ckpt_0004000.pt \
+     q6k=$C/overfit_s1_goal1/ckpt_0006000.pt q8k=$C/overfit_s1_goal1/ckpt_0008000.pt 2>&1 | tee results/R1/R1Z/overfit.log
+   ```
+   100 个样本取自任务 1 的训练数据（种子 0），每个检查点采 8 条（Stage-1 用样本的真实指令）；输出 `overfit_summary.json`（含逐时间步反推误差 `by_t`）。
+   注意：Q 训练时 VLM 冻结，用的是 `apt_vla` 里的 VLM 权重，但 Q 自己的检查点不保存 VLM 权重。检查脚本会读取训练配置里的 `pretrained_ckpt`，把同一份 VLM 权重加载回去；日志应有 `[OVERFIT] ...: VLM weights taken from its pretrained_ckpt checkpoints/hf/apt_vla/ckpt_latest.pt (missing=…, unexpected=0)`，`overfit_summary.json` 中 Q 各检查点的 `vlm_source` 应为该路径，P 为 `base Qwen3-VL`。
+6. **完成后停止并回传**（规格 13.5：不自动进入后续步骤）：
+   ```bash
+   tar --exclude='*.pt' -czf R1Z_results.tar.gz results/R1/R1Z
+   ```
+   另附 `git rev-parse HEAD`、`nvidia-smi`。
+
+## 5C. R1-Y 验证与 VA 重训（规格第 12 节）（第 10 步停止，转 5D）
 
 C 臂全量、A 臂全量、800 步附加检查继续暂停。约定：`RAW=<LIBERO 仓库>/libero/datasets`（官方示教原始文件所在目录，与第 2 节转换时的 `--raw_root` 相同）。0–4 步只做推理，不训练。
 每一步的完整输出都用 `2>&1 | tee results/R1/R1Y/<步骤名>.log` 保存。
@@ -329,4 +398,16 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 4. 位置/姿态限位（`position_limits` / `orientation_limits`）在配置了时会裁剪目标，LIBERO 默认未配置，以 `controller_config.json` 的实际值为准。
 5. 夹爪目标按规格：动作第 7 维 −1 → 1（张开），+1 → 0（闭合），中间值线性映射为 (1 − a)/2。
 转换脚本 `--write_desired` 写入的是控制器实际目标（`controller.goal_pos` / `goal_ori`），同时计算规格公式（含上面第 1、2 条）并在 `desired_check` 中报告二者之差；Y1 / Y3 中 VLA 的“指令目标真值”无法读控制器（旧数据），用的是含第 1、2 条的公式，每个 episode 开头若第一个动作没有旋转分量，以当前姿态代替控制器复位时的姿态目标（只影响姿态，不影响 Y1 的位置判据）。
+
+## 15. 规格第 13 节要点
+1. 新数据是今后唯一的训练数据；“加步数”的判断作废；C 臂、A 臂、R1-D 继续暂停。
+2. R1-Z 只推理部分：Z1 参照值、Z2 固定时间步 loss 与反推误差、Z3 分 suite 检查（含聚类数）、Z4 七步居中滑动平均后重算（只作用于 VA 采样，不改默认路径）。
+3. 过拟合测试：Goal 任务 1，P（Stage-0，`apt_va` 直接加载）与 Q（Stage-1，按第 14 节改为 `apt_vla` 直接加载，不走 `load_from_va`），各 8000 步、单卡 bs 64，每 2000 步一个检查点。
+4. 执行见 5D；完成后停止回传。
+
+## 16. 规格第 14 节要点
+1. 运行 Q 的初始化改为 Hugging Face `apt_vla/ckpt_latest.pt`（预训练 VLA），`--pretrained_ckpt` 直接加载，`train_stage=1`，`load_from_va=False`；保存名仍为 `overfit_s1_goal1`。不再运行 `load_from_va` 版本。
+2. 冒烟第 3 条改为：Q 严格加载 `apt_vla` 成功。
+3. `apt_vla` 的 VLM 是全量微调过的：Q 训练时冻结的 VLM 用的是 `apt_vla` 的 VLM 权重（训练入口加载检查点时会一并载入），P 用的是原版 Qwen3-VL（`apt_va` 训练时 VLM 冻结，没有 `vlm_weights`）。过拟合检查脚本保证评测时各自使用训练时的同一份 VLM。
+4. `train.py` 中 `load_from_va` 之后的层映射打印保留（只在走扩展流程时出现）。
 

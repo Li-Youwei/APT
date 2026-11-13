@@ -165,6 +165,21 @@ class Libero10(Libero):
         return super().inst(["10"], train_stage)
 
 
+class LiberoGoalTask1(Libero):
+    """R1-Z overfit test (exp/R1_va_jev_libero/spec.md 13.3): only LIBERO-Goal task 1
+    ("put the bowl on the stove"). Reuses the LiberoGoal path entry and keeps the files
+    under the task's directory written by examples/libero_r1/convert_libero.py."""
+    TASK_DIR = "put_the_bowl_on_the_stove"
+
+    @classmethod
+    def inst(cls, train_stage: int = 1):
+        files = sorted(f for f in glob.glob(LOC[DSET.LiberoGoal], recursive=True)
+                       if os.path.basename(os.path.dirname(f)) == cls.TASK_DIR)
+        print("[INFO] num samples of {}: {}".format(cls.__name__, len(files)))
+        assert len(files) > 0, "no episodes under .../{}/ in the LiberoGoal location".format(cls.TASK_DIR)
+        return cls(files)
+
+
 class Droid(H5DatasetMapBase):
     data_root = get_loc(__qualname__)
 

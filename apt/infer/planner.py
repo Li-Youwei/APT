@@ -91,6 +91,7 @@ def load_model(path, device, use_ema: bool = False):
         model_name=model_name,
         vlm_finetune_mode=vlm_finetune_mode,
         train_stage=train_stage,
+        has_vlm_weights="vlm_weights" in ckpt,
     )
     return model, data_config
 

@@ -70,21 +70,24 @@ def motion(pos):
     return motion_stats(pos, np.ones(pos.shape[:2]))
 
 
-def build_samples(path):
+def build_samples(path, cls_name="LiberoGoal", n=N_SAMPLES):
+    """n samples (seed 0) through the training loader of dataset class `cls_name`, all
+    augmentation off; cached at `path`. Defaults reproduce X2 exactly."""
     if os.path.exists(path):
         return torch.load(path, weights_only=False)
     from data_utils import datasets
-    cfg = datasets.LiberoGoal.config
+    D = getattr(datasets, cls_name)
+    cfg = D.config
     cfg.photometric_aug = False
     cfg.noise_aug = False
     cfg.geom_aug = False
     cfg.background_aug = False
     cfg.shuffle_cameras = False
-    ds = datasets.LiberoGoal.inst(train_stage=0)
+    ds = D.inst(train_stage=0)
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    idx = np.random.default_rng(SEED).choice(len(ds), size=N_SAMPLES, replace=len(ds) < N_SAMPLES)
+    idx = np.random.default_rng(SEED).choice(len(ds), size=n, replace=len(ds) < n)
     samples = []
     for i, ep in enumerate(idx):
         x = ds[int(ep)]
@@ -93,8 +96,9 @@ def build_samples(path):
         rec["_episode_index"] = int(ep)
         rec["_episode_file"] = ds.h5_filelist[int(ep)]
         samples.append(rec)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(samples, path)
-    print(f"[X2] cached {len(samples)} samples from {len(ds)} LiberoGoal episodes -> {path}")
+    print(f"[X2] cached {len(samples)} samples from {len(ds)} {cls_name} episodes -> {path}")
     return samples
 
 

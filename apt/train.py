@@ -363,6 +363,8 @@ class Trainer:
         # Stage-1 init does that.
         do_va_expand = load_from_va and not is_resume
         self.module.load_from_pretrain(ckpt["weights"], load_from_va=do_va_expand)
+        if do_va_expand and is_main_process():
+            self._report_va_expansion(ckpt["weights"])
 
         if "vlm_weights" in ckpt:
             incompat = self.module.vlm.load_state_dict(
@@ -388,6 +390,30 @@ class Trainer:
         else:
             if is_main_process():
                 print(f"[INFO] Loaded pretrained weights from {ckpt_path}")
+
+    def _report_va_expansion(self, va_weights: Dict[str, Tensor]):
+        """Read-only check after `load_from_pretrain(load_from_va=True)`: print, for every
+        Stage-0 traj-context layer i, which Stage-1 layer now holds identical weights.
+        Expected mapping: i -> 2*i + 1 (apt/vla.py). Does not modify any weight."""
+        import re
+        pat = re.compile(r"^dp_head\.traj_context_attn\.layers\.(\d+)\.(.+)$")
+        s0 = {}
+        for k, v in va_weights.items():
+            m = pat.match(k)
+            if m:
+                s0.setdefault(int(m.group(1)), {})[m.group(2)] = v
+        s1 = {}
+        for k, v in self.module.actor.state_dict().items():
+            m = pat.match(k)
+            if m:
+                s1.setdefault(int(m.group(1)), {})[m.group(2)] = v
+        print("[INFO] load_from_va layer mapping (Stage-0 -> Stage-1, by weight equality):")
+        for i in sorted(s0):
+            hits = [j for j in sorted(s1)
+                    if s1[j].keys() == s0[i].keys() and s1[j][next(iter(s0[i]))].numel() > 0
+                    and all(torch.equal(s1[j][n].detach().cpu(), s0[i][n].detach().cpu()) for n in s0[i])]
+            print(f"    va.layer {i} -> vla.layer {hits} (expected [{2 * i + 1}])"
+                  f"{'' if hits == [2 * i + 1] else '  <-- MISMATCH'}")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 

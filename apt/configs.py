@@ -219,3 +219,11 @@ CONFIGS["r1_va_libero4"] = TrainConfig(
 # Save name: va_libero4_r1b.
 CONFIGS["r1b_va_libero4"] = replace(CONFIGS["r1_va_libero4"], max_iterations=int(60e3))
 
+# R1-Z overfit test (spec sections 13.3 / 14): LIBERO-Goal task 1 only, 1 GPU, bs 64, 8k steps.
+# P = Stage-0 from apt_va loaded directly; Q = Stage-1 from the pretrained VLA apt_vla loaded
+# directly (no load_from_va). Pass --pretrained_ckpt <apt_va | apt_vla> on the command line.
+CONFIGS["overfit_s0_goal1"] = replace(
+    CONFIGS["r1_va_libero4"], dataset_classes=[datasets.LiberoGoalTask1], dataset_weights=[1],
+    bs=64, max_iterations=8000, num_warmup=500, save_interval=2000)
+CONFIGS["overfit_s1_goal1"] = replace(CONFIGS["overfit_s0_goal1"], train_stage=1, load_from_va=False)
+
