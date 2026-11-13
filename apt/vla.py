@@ -31,6 +31,7 @@ class VLA(nn.Module):
         camera_view_dropout: float = 0.0,
         vlm_finetune_mode: str = "frozen",
         use_gradient_checkpointing: bool = False,
+        stage0_action_rope: str = "off",
     ):
         super().__init__()
         self.vlm = VLM(
@@ -46,6 +47,7 @@ class VLA(nn.Module):
             inference_timesteps=inference_timesteps,
             train_stage=train_stage,
             camera_view_dropout=camera_view_dropout,
+            stage0_action_rope=stage0_action_rope,
         )
 
     def parameter_groups(self):
@@ -225,6 +227,7 @@ def vla_tiny(
     camera_view_dropout: float = 0.0,
     vlm_finetune_mode: str = "frozen",
     use_gradient_checkpointing: bool = False,
+    stage0_action_rope: str = "off",
 ):
     return VLA(
         hdim=192,
@@ -235,6 +238,7 @@ def vla_tiny(
         camera_view_dropout=camera_view_dropout,
         vlm_finetune_mode=vlm_finetune_mode,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        stage0_action_rope=stage0_action_rope,
     )
 
 
@@ -245,6 +249,7 @@ def vla_small(
     camera_view_dropout: float = 0.0,
     vlm_finetune_mode: str = "frozen",
     use_gradient_checkpointing: bool = False,
+    stage0_action_rope: str = "off",
 ):
     return VLA(
         hdim=384,
@@ -255,6 +260,7 @@ def vla_small(
         camera_view_dropout=camera_view_dropout,
         vlm_finetune_mode=vlm_finetune_mode,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        stage0_action_rope=stage0_action_rope,
     )
 
 
@@ -265,6 +271,7 @@ def vla_base(
     camera_view_dropout: float = 0.0,
     vlm_finetune_mode: str = "frozen",
     use_gradient_checkpointing: bool = False,
+    stage0_action_rope: str = "off",
 ):
     return VLA(
         hdim=768,
@@ -275,6 +282,7 @@ def vla_base(
         camera_view_dropout=camera_view_dropout,
         vlm_finetune_mode=vlm_finetune_mode,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        stage0_action_rope=stage0_action_rope,
     )
 
 

@@ -122,9 +122,13 @@ class AttentionBlock(nn.Module):
 
 
 class HybridAttentionLayers(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, num_layers: int, train_stage: int):
+    def __init__(self, embed_dim: int, num_heads: int, num_layers: int, train_stage: int,
+                 stage0_action_rope: str = "off"):
         super().__init__()
         self.train_stage = train_stage
+        # R1-Z P2 (exp/R1_va_jev_libero/spec.md 15.3): Stage-0 blocks put RoPE on the half of
+        # the head dims that otherwise has no positional encoding. "off" = original behaviour.
+        s0_pe = ("prope", None) if stage0_action_rope == "off" else ("prope", "rope")
         blocks = []
         if num_layers % 2 == 0:
             va_num_layers = num_layers // 2
@@ -132,7 +136,7 @@ class HybridAttentionLayers(nn.Module):
             va_num_layers = num_layers // 2 + 1
         if train_stage == 0:
             for i in range(va_num_layers):
-                blocks.append(AttentionBlock(embed_dim, num_heads, pe_type=("prope", None))) # !!! if use prope, mask_dilated is needed !!!
+                blocks.append(AttentionBlock(embed_dim, num_heads, pe_type=s0_pe)) # !!! if use prope, mask_dilated is needed !!!
         else:
             for i in range(num_layers):
                 if i % 2 == 0:
@@ -192,9 +196,16 @@ class ContextEncoder(nn.Module):
         vl_outputs: Dict[str, Tensor], 
         action_mask: Tensor, 
         action_ref_pose: Tensor, 
-        fp16: bool
+        fp16: bool,
+        anchor_actions_after_vision: bool = False,
     ):
         """
+        anchor_actions_after_vision: False (original) numbers the action tokens' 1-D
+            positions right after the LAST VL token, i.e. after the instruction text, so
+            the offset depends on the instruction's token count. True numbers them right
+            after the last VISION token (language independent). Only matters where the
+            action RoPE is used.
+
         Args:
             vl_outputs (Dict[str, Tensor]):
                 - camera_mask (Tensor): (B, Ncam)
@@ -255,7 +266,11 @@ class ContextEncoder(nn.Module):
         ################## process Action Expert ##################
         B, Nee, La = action_mask.shape
         action_extr = action_ref_pose[:, :, None].expand(B, Nee, La, 4, 4).reshape(B, Nee*La, 4, 4)
-        pos1d_offset = vl_outputs["pos_id_1d"][:, -1] + 1  # (B,)
+        if anchor_actions_after_vision:
+            pos_v = vl_outputs["pos_id_1d"].masked_fill(~vl_outputs["is_vision_mask"], -1)
+            pos1d_offset = pos_v.max(dim=1).values + 1  # (B,)
+        else:
+            pos1d_offset = vl_outputs["pos_id_1d"][:, -1] + 1  # (B,)
         action_pos1d = torch.arange(La).to(pos1d_offset)[None, None, :] + pos1d_offset[:, None, None]  # (B, 1, La)
         action_pos1d = action_pos1d.expand(B, Nee, La).reshape(B, Nee*La)  # (B, Nee*La)
 
@@ -283,7 +298,8 @@ class DiffusionHead(nn.Module):
     - Output: noisy action at `t-1`
     """
 
-    def __init__(self, hdim: int, num_heads: int, act_dim: int, num_layers: int, train_stage: int):
+    def __init__(self, hdim: int, num_heads: int, act_dim: int, num_layers: int, train_stage: int,
+                 stage0_action_rope: str = "off"):
         super().__init__()
         self.act_dim = act_dim
         self.num_layers = num_layers
@@ -300,7 +316,7 @@ class DiffusionHead(nn.Module):
         self.max_nee = 4  # maximum number of end-effectors supported
         self.arm_id_embed = nn.Parameter(torch.randn(1, self.max_nee, 1, hdim))
         self.traj_context_attn = HybridAttentionLayers(
-            hdim, num_heads, num_layers, train_stage
+            hdim, num_heads, num_layers, train_stage, stage0_action_rope
         )
 
         ### final mlp
@@ -474,10 +490,16 @@ class ActionExpert(nn.Module):
         inference_timesteps: Optional[int] = None,
         train_stage: int = 0,
         camera_view_dropout: float = 0.0,
+        stage0_action_rope: str = "off",
     ):
         super().__init__()
+        assert stage0_action_rope in ("off", "context", "anchored"), stage0_action_rope
+        # "context": RoPE exactly as the context encoder computes it (spec 15.3);
+        # "anchored": same, but action positions start after the last vision token.
+        self.stage0_action_rope = stage0_action_rope if train_stage == 0 else "off"
         self.context_encoder = ContextEncoder(idim, hdim, num_heads, num_diffusion_layers)
-        self.dp_head = DiffusionHead(hdim, num_heads, self.act_dim, num_diffusion_layers, train_stage)
+        self.dp_head = DiffusionHead(hdim, num_heads, self.act_dim, num_diffusion_layers, train_stage,
+                                     self.stage0_action_rope)
 
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=diffusion_timesteps,
@@ -625,6 +647,8 @@ class ActionExpert(nn.Module):
         train_timesteps: Optional[Tensor] = None,
         random_frame_rotation: Optional[bool] = None,
         return_x0: bool = False,
+        train_noise: Optional[Tensor] = None,
+        return_eps: bool = False,
     ):
         """
         Args:
@@ -670,6 +694,10 @@ class ActionExpert(nn.Module):
             random_frame_rotation: None = old behaviour (random rotation of the
                 mean-pose frame in the training branch, none at inference);
                 True / False forces it on / off in either branch (R1-Y Y2).
+            train_noise: (B, Nee, Ta, act_dim) or None. Training branch only: use this noise
+                instead of torch.randn (R1-Z Z5 permutation test).
+            return_eps: training branch only. Also return the raw noise prediction
+                (B, Nee, Ta, act_dim) (R1-Z Z5). Returned after x0 when both are set.
             return_x0: training branch only. Also return the clean trajectory
                 reconstructed from the noise prediction, as world-frame states
                 (B, Ta, Nee, 17) (R1-Y Y3). Requires epsilon prediction.
@@ -742,7 +770,8 @@ class ActionExpert(nn.Module):
             vl_outputs=vl_outputs,
             action_mask=action_mask,
             action_ref_pose=action_ref_pose, 
-            fp16=fp16
+            fp16=fp16,
+            anchor_actions_after_vision=(self.stage0_action_rope == "anchored"),
         )
 
         history_action = states2action(
@@ -766,6 +795,10 @@ class ActionExpert(nn.Module):
             )
 
         if self.train_stage == 0:
+            if self.stage0_action_rope != "off":
+                # PRoPE half unchanged, RoPE on the other half (both inputs are used by the
+                # Stage-0 blocks, which all run the dilated mask)
+                vla_pe_gta = (vla_pe_gta[0], vla_pe[1])
             fixed_inputs = dict(
                 history=history_action,  # shape (B', nhist, act_dim)
                 cur_weT=current_ee_pose,
@@ -815,8 +848,12 @@ class ActionExpert(nn.Module):
 
         ###################### Training ######################
         # sample noise
-        noise = torch.randn(B, Nee, Ta, self.act_dim, 
-                            device=gt_future_ee_states.device)
+        if train_noise is None:
+            noise = torch.randn(B, Nee, Ta, self.act_dim, 
+                                device=gt_future_ee_states.device)
+        else:
+            noise = train_noise.to(gt_future_ee_states.device, torch.float32)
+            assert noise.shape == (B, Nee, Ta, self.act_dim), noise.shape
 
         # sample a random timestep
         if train_timesteps is None:
@@ -838,6 +875,7 @@ class ActionExpert(nn.Module):
 
         # one step denoising
         pred = self.dp_head(timesteps, noisy_trajectory, **fixed_inputs)
+        eps_full = pred[..., :self.act_dim] if return_eps else None  # (B, Nee, Ta, act_dim)
 
         x0_states = None
         if return_x0:
@@ -869,9 +907,12 @@ class ActionExpert(nn.Module):
             "openness_loss": openness_loss.item(),
             "total_loss": total_loss.item()
         }
+        extras = []
         if return_x0:
-            return total_loss, metrics, x0_states
-        return total_loss, metrics
+            extras.append(x0_states)
+        if return_eps:
+            extras.append(eps_full)
+        return (total_loss, metrics, *extras) if extras else (total_loss, metrics)
 
 
 def get_target(traj: Tensor, noise: Tensor, timesteps: Tensor, scheduler: DDIMScheduler):

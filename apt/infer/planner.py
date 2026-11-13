@@ -19,6 +19,9 @@ from .. import vla
 from ..configs import TrainConfig
 
 
+PARSED_EXTRAS: Dict[str, dict] = {}  # ckpt_dir -> extra model-construction fields from its JSON
+
+
 def parse_config(ckpt_dir: str):
     config_files = glob.glob(os.path.join(ckpt_dir, "*.json"))
     config_files.sort()
@@ -38,12 +41,16 @@ def parse_config(ckpt_dir: str):
     with open(config_file, "r", encoding="utf-8") as fp:
         raw_items = json.load(fp)
     train_stage = int(raw_items["train_stage"]) if "train_stage" in raw_items else 1
+    stage0_action_rope = raw_items.get("stage0_action_rope", "off")
 
     data_config.shuffle_cameras = False  # overwrite
     print("[INFO] model = {}".format(model_name))
     print("[INFO] data config = {}".format(data_config))
     print("[INFO] vlm_finetune_mode = {}".format(vlm_finetune_mode))
     print("[INFO] train_stage = {}".format(train_stage))
+    if stage0_action_rope != "off":
+        print("[INFO] stage0_action_rope = {}".format(stage0_action_rope))
+    PARSED_EXTRAS[os.path.abspath(ckpt_dir)] = dict(stage0_action_rope=stage0_action_rope)
 
     return model_name, data_config, vlm_finetune_mode, train_stage
 
@@ -64,8 +71,10 @@ def load_model(path, device, use_ema: bool = False):
     #   - "lora" needs its own LoRA layers to load adapter weights; after
     #     loading we merge and the result is effectively frozen.
     infer_vlm_mode = "lora" if vlm_finetune_mode == "lora" else "frozen"
+    extras = PARSED_EXTRAS.get(os.path.abspath(os.path.dirname(path)), {})
     model: vla.VLA = getattr(vla, "vla_{}".format(model_name))(
-        train_stage=train_stage, vlm_finetune_mode=infer_vlm_mode).to(device)
+        train_stage=train_stage, vlm_finetune_mode=infer_vlm_mode,
+        stage0_action_rope=extras.get("stage0_action_rope", "off")).to(device)
     model.actor.load_state_dict(ckpt["weights"], strict=True)
 
     if "vlm_weights" in ckpt:
@@ -92,6 +101,7 @@ def load_model(path, device, use_ema: bool = False):
         vlm_finetune_mode=vlm_finetune_mode,
         train_stage=train_stage,
         has_vlm_weights="vlm_weights" in ckpt,
+        stage0_action_rope=extras.get("stage0_action_rope", "off"),
     )
     return model, data_config
 
@@ -135,9 +145,14 @@ class TrajPlanner(object):
         ckpt_path: str, 
         device: str = "cuda:0", 
         ensemble: int = -1,
-        use_ema: bool = False
+        use_ema: bool = False,
+        precision: str = "bf16",
     ):
         self.model, self.config = load_model(ckpt_path, device, use_ema)
+        assert precision in ("bf16", "fp32"), precision
+        self.precision = precision
+        if precision == "fp32":
+            self._to_fp32()
 
         self.ensemble = int(ensemble)
         self.ensembler_lock = threading.Lock()
@@ -425,11 +440,29 @@ class TrajPlanner(object):
     # the prompt and the initial noise, so several clients can share one
     # server and results depend only on (weights, frame, prompt, noise).
     # ------------------------------------------------------------------
+    def _to_fp32(self):
+        """Diagnostic fp32 mode (R1-Z smoke 11, spec 16.3): upcast every weight (the frozen VLM is
+        loaded in bf16; bf16 -> fp32 is exact), run the VLM attention with SDPA (flash-attention
+        has no fp32 kernels), disable TF32. Only `sample_trajs` honours it (fp16=False there)."""
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        self.model.float()
+        for m in self.model.modules():
+            cfg = getattr(m, "config", None)
+            for c in (cfg, getattr(cfg, "text_config", None), getattr(cfg, "vision_config", None)):
+                if c is not None and hasattr(c, "_attn_implementation"):
+                    try:
+                        c._attn_implementation = "sdpa"
+                    except Exception:
+                        pass
+        print("[INFO] precision = fp32 (weights upcast, VLM attention -> sdpa, TF32 off)")
+
     def get_meta(self) -> dict:
         meta = dict(getattr(self.model, "r1_meta", {}))
         meta["ta"] = int(self.config.num_future_states)
         meta["nee"] = len(self.config.ee_indices)
         meta["act_dim"] = int(self.model.actor.act_dim)
+        meta["precision"] = getattr(self, "precision", "bf16")
         return meta
 
     def load_weights(self, ckpt_path: str) -> dict:
@@ -437,6 +470,10 @@ class TrajPlanner(object):
         of the same architecture. Strict for the actor."""
         model_name, _data_config, vlm_mode, train_stage = parse_config(os.path.dirname(ckpt_path))
         meta = self.model.r1_meta
+        rope = PARSED_EXTRAS.get(os.path.abspath(os.path.dirname(ckpt_path)), {}).get("stage0_action_rope", "off")
+        assert rope == meta.get("stage0_action_rope", "off"), \
+            "checkpoint {} has stage0_action_rope={}, server model has {}".format(
+                ckpt_path, rope, meta.get("stage0_action_rope", "off"))
         assert (model_name, train_stage) == (meta["model_name"], meta["train_stage"]), \
             "checkpoint {} is ({}, stage {}), server holds ({}, stage {})".format(
                 ckpt_path, model_name, train_stage, meta["model_name"], meta["train_stage"])
@@ -545,6 +582,7 @@ class TrajPlanner(object):
                 assert ref_cam in cands, "ref_cam {!r} not in {} for ee {}".format(ref_cam, cands, ee)
             cfg.ee_ref_cams = {ee: ref_cam for ee in cfg.ee_indices}
 
+        use_fp16 = getattr(self, "precision", "bf16") != "fp32"
         noise_t = torch.from_numpy(np.ascontiguousarray(noise, dtype=np.float32)).to(self.device)
         Kn = noise_t.shape[0]
 
@@ -561,7 +599,7 @@ class TrajPlanner(object):
                     vl_inputs, vl_outputs = self.model.vlm(
                         obs_rgbs=data["obs_rgbs"], obs_masks=data["obs_masks"],
                         obs_norm_xys=data["obs_norm_xys"], obs_extrinsics=data["obs_extrinsics"],
-                        prompt_text=data["prompt_text"], fp16=True)
+                        prompt_text=data["prompt_text"], fp16=use_fp16)
                     vl_inputs = _repeat_batch(vl_inputs, Kn)
                     vl_outputs = _repeat_batch(vl_outputs, Kn)
                     rep = _repeat_batch(data, Kn)
@@ -570,7 +608,7 @@ class TrajPlanner(object):
                     vl_inputs, vl_outputs = self.model.vlm(
                         obs_rgbs=rep["obs_rgbs"], obs_masks=rep["obs_masks"],
                         obs_norm_xys=rep["obs_norm_xys"], obs_extrinsics=rep["obs_extrinsics"],
-                        prompt_text=rep["prompt_text"], fp16=True)
+                        prompt_text=rep["prompt_text"], fp16=use_fp16)
                 seq_len = int(vl_outputs["attention_mask"].shape[1])  # VLM tokens (vision + text + template)
                 actions: Tensor = self.model.actor(
                     vl_inputs=vl_inputs,
@@ -581,7 +619,7 @@ class TrajPlanner(object):
                     gt_future_ee_states=rep["gt_future_ee_states"],
                     valid_ee_mask=rep["valid_ee_mask"],
                     inference=True,
-                    fp16=True,
+                    fp16=use_fp16,
                     initial_noise=noise_t,
                 )  # (K, Ta, nee_sel, 17)
             if self.device.startswith("cuda"):

@@ -60,6 +60,11 @@ class TrainConfig(object):
     camera_view_dropout: float = 0.0  # probability of dropping one camera view during training
 
     seed: int | None = None  # None = unseeded (old behaviour); else torch/numpy/random seeded with seed + rank
+    # Stage-0 only: RoPE on the free half of the attention head dims for the action tokens
+    # (exp/R1_va_jev_libero/spec.md 15.3). "off" = original; "context" = positions as the context
+    # encoder computes them (offset after the last VL token, i.e. after the instruction text);
+    # "anchored" = positions start after the last vision token (instruction-length independent).
+    stage0_action_rope: str = "off"
     
     def __post_init__(self):
         for i, D in enumerate(self.dataset_classes):
@@ -226,4 +231,9 @@ CONFIGS["overfit_s0_goal1"] = replace(
     CONFIGS["r1_va_libero4"], dataset_classes=[datasets.LiberoGoalTask1], dataset_weights=[1],
     bs=64, max_iterations=8000, num_warmup=500, save_interval=2000)
 CONFIGS["overfit_s1_goal1"] = replace(CONFIGS["overfit_s0_goal1"], train_stage=1, load_from_va=False)
+
+# R1-Z P2 (spec sections 15.3 / 16): P with Stage-0 action RoPE, "anchored" mode only. The
+# "context" mode leaks the instruction's token count into the VA and must not be used for any
+# VA training or evaluation (spec 16.2); no config entry is provided for it.
+CONFIGS["overfit_s0ropeA_goal1"] = replace(CONFIGS["overfit_s0_goal1"], stage0_action_rope="anchored")
 

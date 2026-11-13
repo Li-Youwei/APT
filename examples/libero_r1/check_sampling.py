@@ -16,6 +16,13 @@ bf16 amplification, not a failure; formal runs always use the shared path.
 [4] (diagnostic, not a pass criterion) shows how far the same noise lands
 under the two reference cameras -- the mechanism behind the 2026-11-11 failure.
 
+Smoke 11, unpadded control (spec section 16.3), VA server only:
+  python -m examples.libero_r1.check_sampling --uri va --smoke11_unpadded
+true instruction vs plain "do nothing" (different token counts), both cameras.
+On a service started with `--precision fp32`: PASS iff max position diff <= 1e-4 m
+(FAIL = language leaks into the VA: stop and report). On a bf16 service the same
+numbers are only recorded (bf16 rounding is amplified to mm scale, spec 16.3).
+
 Smoke-11 diagnostic (not a pass criterion; run on the VA server, then on the
 VLA server as a positive control):
   python -m examples.libero_r1.check_sampling --uri va  --diag11
@@ -68,6 +75,8 @@ def main(args):
         sys.exit(0)
     if args.smoke11:
         sys.exit(0 if smoke11(pol, frame, instr, noise) else 1)
+    if args.smoke11_unpadded:
+        sys.exit(0 if smoke11_unpadded(pol, frame, instr, noise) else 1)
 
     ok = True
     first = {}
@@ -151,6 +160,32 @@ def smoke11(pol, frame, instr, noise) -> bool:
     return ok
 
 
+SMOKE11_FP32_MAX = 1e-4  # m, spec 16.3
+
+
+def smoke11_unpadded(pol, frame, instr, noise) -> bool:
+    meta = pol.meta
+    assert meta["train_stage"] == 0, f"the unpadded smoke 11 is for VA servers: {meta}"
+    prec, rope = meta.get("precision", "bf16"), meta.get("stage0_action_rope", "off")
+    assert rope != "context", "stage0_action_rope=context must not be evaluated (spec 16.2)"
+    print(f"[INFO] smoke 11 unpadded: precision={prec}, stage0_action_rope={rope}, ckpt={meta.get('ckpt_path')}")
+    worst = 0.0
+    for cam in REF_CAMS:
+        a = pol.sample(frame, instr, noise, cam)
+        z = pol.sample(frame, "do nothing", noise, cam)
+        d = float(np.abs(a["pos"] - z["pos"]).max())
+        worst = max(worst, d)
+        print(f"[SMOKE-11-UNPADDED] ref_cam={cam}: {instr!r} ({a['seq_len']} tokens) vs 'do nothing' ({z['seq_len']} tokens): "
+              f"max |diff| of positions = {d:.3e} m ({d*1000:.3f} mm)")
+    if prec == "fp32":
+        ok = worst <= SMOKE11_FP32_MAX
+        print(f"[SMOKE-11-UNPADDED] fp32, worst {worst:.3e} m (<= {SMOKE11_FP32_MAX:g}) -> "
+              f"{'PASS' if ok else 'FAIL (language leak: stop and report)'}")
+        return ok
+    print(f"[SMOKE-11-UNPADDED] bf16, worst {worst*1000:.3f} mm -> RECORD ONLY (compare with the 'off' model)")
+    return True
+
+
 def diag11(pol, frame, instr, noise, suite):
     cam = REF_CAMS[0]
     one = noise[:1]
@@ -208,4 +243,6 @@ if __name__ == "__main__":
     p.add_argument("--smoke11", action="store_true",
                    help="run only smoke test 11 (token-matched language check; VA and VLA servers)")
     p.add_argument("--diag11", action="store_true", help="length-matched language-invariance diagnostic")
+    p.add_argument("--smoke11_unpadded", action="store_true",
+                   help="spec 16.3: true instruction vs unpadded 'do nothing' (judged on fp32 services only)")
     main(p.parse_args())

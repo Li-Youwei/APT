@@ -23,6 +23,14 @@ Definitions (all positions in metres in the CSV/JSON, the console prints cm):
   Z2: for each sample and each fixed timestep t in {0,1,2,5,10,20,40,60,80,99}, 4 random
     noises (training branch, training-time frame randomisation, seeded) -> pos_loss and the
     position error of the clean trajectory reconstructed from the noise prediction.
+  Z5 (spec 15.2, `equivariance`): 20 LiberoGoal samples (seed 0); at t in {5, 50, 95} the
+    denoiser's noise prediction for a noisy trajectory vs for the same trajectory with its 32
+    future tokens permuted (permutation seed = sample index), un-permuted; max |diff|. Same
+    noise, frame rotation off, bf16 as in training.
+  Z6 (spec 15.2, part of `suites`): order-free set error = (mean over predicted points of the
+    distance to the nearest true point + mean over true points of the distance to the nearest
+    predicted point) / 2, best of K; reported as `set_err_best_median` next to the ordered
+    `err_best_median`, for the raw and the smoothed VA samples and for the VLA.
 """
 from __future__ import annotations
 
@@ -62,10 +70,18 @@ def gt_arrays(rec):
     return (fut[:, 0, :16].reshape(-1, 4, 4)[:, :3, 3].double().numpy(), fut[:, 0, 16].double().numpy())
 
 
+def set_error(ppos, gpos):
+    """(K,T,3) predicted vs (T,3) true -> (K,) symmetric mean nearest-point distance."""
+    d = np.linalg.norm(ppos[:, :, None, :] - gpos[None, None, :, :], axis=-1)   # (K, T, T)
+    return 0.5 * (d.min(axis=2).mean(axis=1) + d.min(axis=1).mean(axis=1))
+
+
 def traj_metrics(ppos, pgrip, rec, with_clusters):
+    gpos, _ = gt_arrays(rec)
     adj = np.linalg.norm(np.diff(ppos, axis=1), axis=-1)       # (K, T-1)
     sg = Y.step_and_grip(ppos, pgrip, rec["gt_future_ee_states"])
     out = dict(adj=adj.ravel(), adj_sample_median=float(np.median(adj)), err_best=sg["err_best"],
+               set_err_best=float(set_error(ppos, gpos).min()),
                **{f"err_step{k}": sg[f"err_step{k}"] for k in STEP_IDS})
     out["n_clusters"] = TS.make_candidates(ppos, pgrip).n_clusters if with_clusters else 1
     return out
@@ -76,6 +92,7 @@ def summarize(recs):
     s = dict(n=len(recs), adj_median_pooled=float(np.median(pooled)), adj_p95_pooled=float(np.percentile(pooled, 95)),
              adj_median_of_samples=float(np.median([r["adj_sample_median"] for r in recs])),
              err_best_median=float(np.median([r["err_best"] for r in recs])),
+             set_err_best_median=float(np.median([r["set_err_best"] for r in recs])),
              n_clusters_mean=float(np.mean([r["n_clusters"] for r in recs])))
     s.update({f"err_step{k}_median": float(np.median([r[f"err_step{k}"] for r in recs])) for k in STEP_IDS})
     return s
@@ -92,6 +109,7 @@ def write_rows(path, rows):
 
 def flat_row(tag, i, r):
     return dict(tag=tag, sample=i, adj_sample_median=r["adj_sample_median"], err_best=r["err_best"],
+                set_err_best=r["set_err_best"],
                 n_clusters=r["n_clusters"], **{f"err_step{k}": r[f"err_step{k}"] for k in STEP_IDS})
 
 
@@ -142,11 +160,13 @@ def run_suites(args, device):
             g = res[s]["ground_truth"]
             line = (f"[Z] {s:<14} {label:<4} adj med/p95 {cm(res[s][label]['adj_median_pooled'])}/"
                     f"{cm(res[s][label]['adj_p95_pooled'])} cm (GT {cm(g['adj_median_pooled'])}/{cm(g['adj_p95_pooled'])}), "
-                    f"best err {cm(res[s][label]['err_best_median'])} cm, step1 {cm(res[s][label]['err_step1_median'])} cm, "
+                    f"best err {cm(res[s][label]['err_best_median'])} cm (set {cm(res[s][label]['set_err_best_median'])}), "
+                    f"step1 {cm(res[s][label]['err_step1_median'])} cm, "
                     f"clusters {res[s][label]['n_clusters_mean']:.1f}")
             if smo:
                 sm = res[s][label + "_smooth7"]
-                line += (f" | smooth7: adj {cm(sm['adj_median_pooled'])} cm, best err {cm(sm['err_best_median'])} cm, "
+                line += (f" | smooth7: adj {cm(sm['adj_median_pooled'])} cm, best err {cm(sm['err_best_median'])} cm "
+                         f"(set {cm(sm['set_err_best_median'])}), "
                          f"step1 {cm(sm['err_step1_median'])} cm, clusters {sm['n_clusters_mean']:.1f}")
             print(line, flush=True)
         del model
@@ -264,22 +284,78 @@ def run_overfit(args, device):
         json.dump(res, fp, indent=2)
 
 
+# ── Z5 permutation equivariance ──────────────────────────────────────────────
+
+Z5_TIMESTEPS = (5, 50, 95)
+
+
+def run_equivariance(args, device):
+    samples = X2.build_samples(os.path.join(args.out_dir, "samples_goal20.pt"), "LiberoGoal", args.n_samples)
+    res, rows = {}, []
+    for label, ckpt in (("va", args.va), ("vla", args.vla)):
+        model = Y.load(ckpt, device)
+        act_dim = model.actor.act_dim
+        diffs = {t: [] for t in Z5_TIMESTEPS}
+        for i, rec in enumerate(samples):
+            d = X2.batch1(rec, device)
+            Ta, nee = d["gt_future_ee_states"].shape[1:3]
+            noise = torch.from_numpy(np.random.default_rng(i).standard_normal((1, nee, Ta, act_dim)).astype(np.float32)).to(device)
+            perm = torch.from_numpy(np.random.default_rng(i).permutation(Ta)).to(device)
+            inv = torch.argsort(perm)
+            with torch.inference_mode():
+                vl_in, vl_out = model.vlm(obs_rgbs=d["obs_rgbs"], obs_masks=d["obs_masks"],
+                                          obs_norm_xys=d["obs_norm_xys"], obs_extrinsics=d["obs_extrinsics"],
+                                          prompt_text=d["prompt_text"], fp16=True)
+                for t in Z5_TIMESTEPS:
+                    outs = []
+                    for p in (None, perm):
+                        gt = d["gt_future_ee_states"] if p is None else d["gt_future_ee_states"][:, p]
+                        nz = noise if p is None else noise[:, :, p]
+                        _l, _m, e = model.actor(
+                            vl_inputs=dict(vl_in), vl_outputs=dict(vl_out), current_ee_pose=d["current_ee_pose"],
+                            action_ref_pose=d["action_ref_pose"], history_ee_states=d["history_ee_states"],
+                            gt_future_ee_states=gt, valid_ee_mask=d["valid_ee_mask"], inference=False, fp16=True,
+                            train_timesteps=torch.full((1,), t, dtype=torch.long, device=device), train_noise=nz,
+                            random_frame_rotation=False, return_eps=True)
+                        outs.append(e.float() if p is None else e.float()[:, :, inv])
+                    dd = float((outs[0] - outs[1]).abs().max())
+                    diffs[t].append(dd)
+                    rows.append(dict(model=label, sample=i, t=t, max_abs_diff=dd))
+        res[label] = dict(ckpt=ckpt, iter=model.r1_meta["current_iters"],
+                          stage0_action_rope=model.r1_meta.get("stage0_action_rope", "off"),
+                          by_t={str(t): dict(max=float(np.max(v)), median=float(np.median(v))) for t, v in diffs.items()})
+        print(f"[Z5] {label}: " + ", ".join(f"t{t}: max {np.max(v):.3e} / median {np.median(v):.3e}"
+                                            for t, v in diffs.items()), flush=True)
+        del model
+        torch.cuda.empty_cache()
+    va_max = max(v["max"] for v in res["va"]["by_t"].values())
+    vla_min = min(v["median"] for v in res["vla"]["by_t"].values())
+    res["verdict"] = dict(va_equivariant=bool(va_max <= 1e-2), vla_not_equivariant=bool(vla_min > 0.1))
+    write_rows(os.path.join(args.out_dir, "z5_rows.csv"), rows)
+    with open(os.path.join(args.out_dir, "z5_summary.json"), "w") as fp:
+        json.dump(res, fp, indent=2)
+    print(f"[Z5-VERDICT] VA max diff {va_max:.3e} (<= 1e-2: equivariant={va_max <= 1e-2}); "
+          f"VLA smallest median diff {vla_min:.3e} (> 0.1: not equivariant={vla_min > 0.1})")
+
+
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     device = "cuda:0"
-    {"suites": run_suites, "timesteps": run_timesteps, "overfit": run_overfit}[args.cmd](args, device)
+    {"suites": run_suites, "timesteps": run_timesteps, "overfit": run_overfit,
+     "equivariance": run_equivariance}[args.cmd](args, device)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["suites", "timesteps", "overfit"])
+    p.add_argument("cmd", choices=["suites", "timesteps", "overfit", "equivariance"])
     p.add_argument("--va", default="checkpoints/APT/va_libero4_r1b/ckpt_0060000.pt")
     p.add_argument("--vla", default="checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt")
     p.add_argument("--models", nargs="*", default=[], help="overfit: label=ckpt")
     p.add_argument("--suites", nargs="+", default=list(SUITE_CLS), choices=list(SUITE_CLS))
-    p.add_argument("--n_samples", type=int, default=None, help="default 200 (suites, timesteps) / 100 (overfit)")
+    p.add_argument("--n_samples", type=int, default=None,
+                   help="default 200 (suites, timesteps) / 100 (overfit) / 20 (equivariance)")
     p.add_argument("--out_dir", default="results/R1/R1Z")
     a = p.parse_args()
     if a.n_samples is None:
-        a.n_samples = 100 if a.cmd == "overfit" else 200
+        a.n_samples = {"overfit": 100, "equivariance": 20}.get(a.cmd, 200)
     main(a)

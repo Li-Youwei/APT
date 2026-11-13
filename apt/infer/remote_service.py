@@ -100,6 +100,8 @@ def run_service():
     parser.add_argument("--host", type=str, default="localhost", help="daemon host")
     parser.add_argument("--port", type=int, default=0, help="daemon port")
     parser.add_argument("--ensemble", type=int, default=4, help="ensemble traj for smoothness")
+    parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
+                        help="fp32 = diagnostic mode for sample_trajs (R1-Z smoke 11); default bf16")
     opt = parser.parse_args()
 
     assert len(opt.ckpt), "Please specify a valid ckpt path."
@@ -108,7 +110,8 @@ def run_service():
         ckpt_path=opt.ckpt, 
         device="cuda:0",
         ensemble=opt.ensemble,
-        use_ema=opt.ema
+        use_ema=opt.ema,
+        precision=opt.precision,
     )
 
     run_simple_server(

@@ -128,6 +128,72 @@ python scripts/test_ckpt.py --ckpt checkpoints/hf/apt_vla/ckpt_latest.pt --train
    ```
    另附 `git rev-parse HEAD`、`nvidia-smi`。
 
+## 5E. R1-Z 追加项 Z5、Z6、P2（规格第 15 节）
+
+5D 中已经启动的 Z1–Z4 和 P、Q **不要中断**。以下是追加项，环境与 5D 相同（APT 环境、新数据 YAML、先 `git pull`）。**拉取后再启动的任何进程都会用到新代码；新代码在 `stage0_action_rope=off`（默认）时与旧代码逐位相同，已在运行的进程不受影响。**
+
+**冒烟（规格 13.5 第 1 条适用于 Z5、Z6）**
+1. ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z equivariance --n_samples 5 --out_dir results/R1/R1Z/smoke 2>&1 | tee results/R1/R1Z/smoke_z5.log
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z suites --n_samples 5 --out_dir results/R1/R1Z/smoke_z6 2>&1 | tee results/R1/R1Z/smoke_z6.log
+   ```
+   通过：退出码 0；`z5_summary.json` 有 VA、VLA 两组；`smoke_z6` 的 `z_suites_summary.json` 中各项含 `set_err_best_median`。
+2. P2 训练 100 步（规格第 16 节：只用 `anchored` 模式；任一空闲 GPU，`--master_port` 与在跑的训练不同）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29513 -m apt.train --backend ddp --config overfit_s0ropeA_goal1 \
+     -s overfit_s0ropeA_goal1_smoke --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt \
+     --max_iterations 100 --save_interval 100 --save_latest_interval 100 2>&1 | tee results/R1/R1Z/smoke_train_P2.log
+   grep -n "stage0_action_rope" checkpoints/APT/overfit_s0ropeA_goal1_smoke/*.json
+   ```
+   通过：无报错跑完 100 步（`apt_va` 严格加载成功，RoPE 没有参数）；检查点目录的 JSON 中有 `"stage0_action_rope": "anchored"`。
+
+**正式运行**
+3. **Z5**（20 个样本，任一 GPU）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z equivariance --out_dir results/R1/R1Z 2>&1 | tee results/R1/R1Z/z5.log
+   ```
+   输出 `z5_summary.json`（各时间步最大与中位数差、`verdict`）和 `z5_rows.csv`；判定行 `[Z5-VERDICT]`。
+4. **Z6**：Z6 的集合误差在 `suites` 里计算。
+   - 若 5D 第 3 步的 `suites` **还没开始**：直接按 5D 第 3 步运行（新代码已包含 Z6），不需要额外运行。
+   - 若 `suites` **已在跑或已跑完**：不要中断，另跑一次到新目录（样本抽取与采样种子确定，Z1/Z3/Z4 结果会与原次一致，可作交叉核对）：
+     ```bash
+     CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z suites --out_dir results/R1/R1Z/z6 2>&1 | tee results/R1/R1Z/z6.log
+     ```
+5. **P2 训练**（`anchored` 模式；单卡、bs 64、8000 步，其余同 P；GPU 由空闲情况决定，例如 GPU1 在 Q 之后、或 GPU0 在只推理部分之后）：
+   ```bash
+   CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 --master_port 29513 -m apt.train --backend ddp --config overfit_s0ropeA_goal1 \
+     -s overfit_s0ropeA_goal1 --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt 2>&1 | tee results/R1/R1Z/train_P2.log
+   python -m examples.libero_r1.r1t_report --log_dir logs/APT/overfit_s0ropeA_goal1 --ckpt_dir checkpoints/APT/overfit_s0ropeA_goal1 --out_dir results/R1/R1Z/train_P2 --every 100
+   C=checkpoints/APT
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z overfit --out_dir results/R1/R1Z/overfit_p2 --models \
+     p2_2k=$C/overfit_s0ropeA_goal1/ckpt_0002000.pt p2_4k=$C/overfit_s0ropeA_goal1/ckpt_0004000.pt \
+     p2_6k=$C/overfit_s0ropeA_goal1/ckpt_0006000.pt p2_8k=$C/overfit_s0ropeA_goal1/ckpt_0008000.pt 2>&1 | tee results/R1/R1Z/overfit_p2.log
+   ```
+   `stage0_action_rope=context` 的代码保留但**不得用于任何 VA 训练或评测**（规格 16.2）；`check_sampling` 遇到 `context` 模式的服务会直接拒绝。
+6. **P2 的冒烟 11**（规格 15.3、16.3；P、P2 的 8k 检查点都已存在后执行）。用到三个 VA 服务，依次起、测完即停（同一时刻只开一个，`--uri va`；pyro4-ns 已在 9091 运行）。LIBERO 环境中的每条检查命令都 `| tee` 到 `results/R1/R1Z/smoke11_<名字>.log`。
+   - **a. P2，bf16**（APT 环境起服务）：
+     ```bash
+     CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt checkpoints/APT/overfit_s0ropeA_goal1/ckpt_0008000.pt --uri va --ns_port 9091 --ensemble 0 &
+     ```
+     LIBERO 环境：
+     ```bash
+     python -u -m examples.libero_r1.check_sampling --uri va --smoke11            # token 数对齐：必须 PASS
+     python -u -m examples.libero_r1.check_sampling --uri va --smoke11_unpadded   # 未补长：bf16 只记录
+     ```
+   - **b. P（`off`），bf16**，作为 a 中未补长对照的同量级参照：用 `checkpoints/APT/overfit_s0_goal1/ckpt_0008000.pt` 起服务，只跑 `--smoke11_unpadded`（只记录）。
+   - **c. P2，fp32**（判定项）：
+     ```bash
+     CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt checkpoints/APT/overfit_s0ropeA_goal1/ckpt_0008000.pt --uri va --ns_port 9091 --ensemble 0 --precision fp32 &
+     ```
+     服务日志应有 `stage0_action_rope = anchored` 和 `precision = fp32 (weights upcast, VLM attention -> sdpa, TF32 off)`。LIBERO 环境：
+     ```bash
+     python -u -m examples.libero_r1.check_sampling --uri va --smoke11_unpadded   # 必须 PASS（<= 1e-4 m）
+     ```
+     不通过即判语言泄漏：停止，回传完整输出与服务日志。若 fp32 服务启动或采样报错（例如 VLM 注意力实现不支持 fp32），同样停止并回传完整报错栈。
+   - 判定汇总：a 的 `--smoke11` PASS；a 与 b 的未补长差值同量级（只记录，供研究侧比较）；c PASS。
+
+7. 回传：把 `results/R1/R1Z/` 整体打包（同 5D 第 6 步）。完成后停止。
+
 ## 5C. R1-Y 验证与 VA 重训（规格第 12 节）（第 10 步停止，转 5D）
 
 C 臂全量、A 臂全量、800 步附加检查继续暂停。约定：`RAW=<LIBERO 仓库>/libero/datasets`（官方示教原始文件所在目录，与第 2 节转换时的 `--raw_root` 相同）。0–4 步只做推理，不训练。
@@ -410,4 +476,19 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 2. 冒烟第 3 条改为：Q 严格加载 `apt_vla` 成功。
 3. `apt_vla` 的 VLM 是全量微调过的：Q 训练时冻结的 VLM 用的是 `apt_vla` 的 VLM 权重（训练入口加载检查点时会一并载入），P 用的是原版 Qwen3-VL（`apt_va` 训练时 VLM 冻结，没有 `vlm_weights`）。过拟合检查脚本保证评测时各自使用训练时的同一份 VLM。
 4. `train.py` 中 `load_from_va` 之后的层映射打印保留（只在走扩展流程时出现）。
+
+## 17. 规格第 15 节：代码核对结论与一个需要研究侧裁决的点
+1. **核对结论：假设的前提成立。** Stage-0 中没有任何步序信息进入 32 个未来动作 token：
+   - 输入端：`traj_enc` / `hist_enc` 逐 token 编码数值，`abs_pos_enc` 由该 token 自己的（带噪）数值算出的位置编码，`arm_id_embed` 只区分机械臂；没有步序嵌入。
+   - 注意力：Stage-0 的块是 `pe_type=("prope", None)`，前一半维度用 PRoPE，所有动作 token 的位姿都是同一个 `action_ref_pose`，后一半维度不加位置编码；Stage-0 的 `fixed_inputs` 中 `vla_pe = vla_pe_gta`，上下文编码器算出的 RoPE 没有用到。
+   - 掩码：动作 token 之间全连接（`generate_action_mask` 全 1，不是因果掩码）；归一化、FFN、输出头都是逐 token 的。
+   - 本地用真实（随机初始化）的 `ActionExpert` 在 fp32 下验证：未改代码时打乱 32 个未来 token 再还原，噪声预测差 4.8e-7（舍入级），即严格置换等变。
+2. **P2 的实现**：新配置字段 `stage0_action_rope`（`off` 默认 / `context` / `anchored`），写入检查点 JSON，推理端 `apt/infer/planner.py` 据此建模型；RoPE 没有参数，`apt_va` 严格加载；`off` 时与改动前逐位相同（本地对比提交 `00fe3e4` 的代码：推理输出与训练 loss 完全相同）；Stage-1 不受影响；`apt/vla.py` 的 IMPORTANT 加载段未改动。
+3. **需要研究侧裁决：15.3 原文的 RoPE 会让指令长度进入 VA。** 上下文编码器给动作 token 编一维位置时，从整个视觉语言序列的最后一个 token（即指令文字之后）往后数（`pos1d_offset = pos_id_1d[:, -1] + 1`）。开启 RoPE 后，动作 token 与视觉 token 之间的相对位置就随指令的 token 数变化——VA 能“看到”指令有多长（内容仍被掩码屏蔽）。本地实测：`context` 模式下仅把指令从 5 个 token 改成 9 个，噪声预测变化 0.12；而 token 数对齐的冒烟 11 按构造检测不到这种泄漏。另实现了 `anchored` 模式：动作位置改为从最后一个视觉 token 之后开始，与指令无关（同样测试差 4.8e-7），同样打破置换等变（打乱后差 0.2）。研究侧已在规格第 16 节裁决：P2 只用 `anchored`（见第 18 节）。
+
+## 18. 规格第 16 节要点
+1. P2 只用 `anchored` 模式，配置与保存名 `overfit_s0ropeA_goal1`；15.3 中“使用上下文编码器已经算好的 RoPE”作废。
+2. 不运行 `context` 模式的训练；代码保留，但今后任何 VA 训练和评测一律不得使用。
+3. 冒烟 11 增加未补长对照：bf16 下 `anchored` 与 `off` 的差值应同量级（只记录）；fp32 下 `anchored` 的位置最大差 ≤ 1e-4 m，不通过即判语言泄漏（5E 第 6 步）。
+4. fp32 是推理服务的诊断模式（`remote_service --precision fp32`）：所有权重上转 fp32（冻结 VLM 原为 bf16，上转无损），VLM 注意力改用 SDPA，关闭 TF32；只作用于 `sample_trajs`，默认 bf16 行为不变。
 

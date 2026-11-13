@@ -244,6 +244,7 @@ class Trainer:
             camera_view_dropout=self.cfg.camera_view_dropout,
             vlm_finetune_mode=self.cfg.vlm_finetune_mode,
             use_gradient_checkpointing=self.cfg.use_gradient_checkpointing,
+            stage0_action_rope=self.cfg.stage0_action_rope,
         ).to(self.model_device)
 
         decay, no_decay = raw_model.parameter_groups()
