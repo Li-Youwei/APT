@@ -59,7 +59,97 @@ VA 服务起来后（LIBERO 环境）：`python -m examples.libero_r1.check_samp
 
 > 2026-11-11 修复：动作参考相机原先由服务端用未设种子的 `random` 每次随机挑选，导致同一噪声两次调用结果不同（检查 [1] 失败）。现在由客户端从 episode 种子派生的独立随机流抽取并显式传给服务，分布不变（两相机各 1/2），噪声流不变。改了服务端代码，必须重启两个推理服务后再复验；客户端若连到旧服务会直接报 `server ignored ref_cam`。
 
-## 5D. 诊断实验 R1-Z（规格第 13 节）—— 现在从这里开始
+## 5F. R1-T3：带锚定 RoPE 的 VA 全量重训与第一阶段恢复（规格第 17 节）—— 现在从这里开始
+
+R1-Z 已完成（5D、5E 不再执行）。今后所有 VA 一律用锚定 RoPE；`va_libero4_r1`、`va_libero4_r1b` 不再用于任何实验。本节按顺序执行，判据不过就停止回传；全部通过则一直执行到打包，不需要等研究侧通知。完整输出都 `2>&1 | tee` 到所在步骤的目录。
+
+0. `git pull`（分支 `r1-phase1`）。APT 环境的所有训练、数据相关命令都在新数据的 shell 中执行：
+   ```bash
+   export APT_DATA_LOC=$PWD/data_utils/data_loc.r1b.local.yaml APT_DATA_LOC_HOST=r1
+   mkdir -p results/R1/R1T3/check results/R1/R1T3/smoke11
+   ```
+1. **训练（规格 17.2）**，两卡 DDP：
+   ```bash
+   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 -m apt.train --backend ddp --config r1c_va_libero4 -s va_libero4_r1c \
+     --pretrained_ckpt checkpoints/hf/apt_va/ckpt_latest.pt 2>&1 | tee results/R1/R1T3/train.log
+   grep -n "stage0_action_rope" checkpoints/APT/va_libero4_r1c/*.json        # 应为 "anchored"
+   python -m examples.libero_r1.r1t_report --log_dir logs/APT/va_libero4_r1c --ckpt_dir checkpoints/APT/va_libero4_r1c --out_dir results/R1/R1T3
+   ```
+   与 2.1 相同（2 卡 × bs 32、40000 步、每 10000 步保存、种子 0），`apt_va` 严格加载（不匹配会报错退出）。显存不足时按 2.1 的降批量方案并注明。记录同 4.1 节（`r1t_report` 输出 loss CSV、墙钟时间与峰值显存）。
+2. **训练后检查第 1–3 条（规格 17.3）**，APT 环境单卡：
+   ```bash
+   C=checkpoints/APT/va_libero4_r1c
+   CUDA_VISIBLE_DEVICES=0 python -u -m examples.libero_r1.diag_r1z r1c_check --out_dir results/R1/R1T3/check --with_vla \
+     --models va20k=$C/ckpt_0020000.pt va30k=$C/ckpt_0030000.pt va40k=$C/ckpt_0040000.pt 2>&1 | tee results/R1/R1T3/check/r1c_check.log
+   ```
+   四个 suite × 200 个样本（种子 0）× 8 条，记录 Z1（真值与 VLA 参照）、Z3、Z6 的全部指标，写入 `r1c_check_summary.json`，并给出每个检查点第 1–3 条的判定：
+   1. 四个 suite 相邻步位移汇总中位数都 ≤ 1.5 cm；
+   2. 四个 suite 第 1 步误差中位数都 ≤ 2 cm；
+   3. Spatial、Object 最优轨迹误差中位数都 ≤ 3 cm。
+
+   Goal、Long 的最优轨迹误差只记录，不设门槛。
+3. **训练后检查第 4 条：冒烟 11**，对 40k 和 30k 各做一遍。每个检查点起两次 VA 服务（同一时刻只开一个，`--uri va`；pyro4-ns 在 9091），测完即停：
+   ```bash
+   # APT 环境，K 取 40000 或 30000
+   CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt $C/ckpt_00${K}.pt --uri va --ns_port 9091 --ensemble 0 \
+     2>&1 | tee results/R1/R1T3/smoke11/service_${K}_bf16.log &
+   # LIBERO 环境
+   python -u -m examples.libero_r1.check_sampling --uri va --smoke11 2>&1 | tee results/R1/R1T3/smoke11/va${K%000}k_aligned.log
+   # 停掉服务后以 fp32 重起（APT 环境）
+   CUDA_VISIBLE_DEVICES=0 python -m apt.infer.remote_service --ckpt $C/ckpt_00${K}.pt --uri va --ns_port 9091 --ensemble 0 \
+     --precision fp32 2>&1 | tee results/R1/R1T3/smoke11/service_${K}_fp32.log &
+   # LIBERO 环境
+   python -u -m examples.libero_r1.check_sampling --uri va --smoke11_unpadded 2>&1 | tee results/R1/R1T3/smoke11/va${K%000}k_fp32.log
+   ```
+   两条判定线：`[SMOKE-11] overall (VA side): PASS`（token 对齐，≤ 1e-4 m）与 `[SMOKE-11-UNPADDED] fp32 ... -> PASS`（不等长，fp32，≤ 1e-4 m）。服务日志中应有 `stage0_action_rope = anchored`。fp32 服务若启动或采样报错，停止并回传完整报错栈。
+4. **选检查点**（40k 优先，其次 30k，都不过则停止）：
+   ```bash
+   S=results/R1/R1T3/smoke11
+   python -m examples.libero_r1.diag_r1z r1c_select --check_json results/R1/R1T3/check/r1c_check_summary.json \
+     --smoke11 va40k=$S/va40k_aligned.log,$S/va40k_fp32.log va30k=$S/va30k_aligned.log,$S/va30k_fp32.log \
+     --out_dir results/R1/R1T3/check 2>&1 | tee results/R1/R1T3/check/r1c_select.log
+   ```
+   退出码 1（`no checkpoint passes`）：停止，打包 `results/R1/R1T3` 回传。通过时写出 `results/R1/R1T3/check/selected_ckpt.txt` 和 `r1c_selection.json`。
+5. **归档旧 VA 的结果（规格 17.4）**，不与新结果混放：
+   ```bash
+   mkdir -p results/R1/archive_actual_pose
+   for d in R1D smoke/C smoke/A_rep1 smoke/A_rep2 smoke/resume smoke/R1D; do
+     [ -e results/R1/$d ] && mkdir -p results/R1/archive_actual_pose/$(dirname $d) && mv results/R1/$d results/R1/archive_actual_pose/$d
+   done
+   cp exp/R1_va_jev_libero/results_note_r1c.md results/R1/VA_R1C_NOTE.md      # 结果包顶层说明（规格 17.5）
+   ```
+   D 臂结果（`results/R1/R1C/vla`）与 VLA 有关、与 VA 无关，保留不动。
+6. **恢复第一阶段（规格 17.4）**：
+   ```bash
+   VA_CKPT=$(cat results/R1/R1T3/check/selected_ckpt.txt)
+   SEL_ITER=$(python -c "import json;print(json.load(open('results/R1/R1T3/check/r1c_selection.json'))['selected']['iter'])")
+   ```
+   服务（APT 环境）：VLA 照旧在 GPU1；VA 在 GPU0 用 `$VA_CKPT` 启动，日志 `tee results/R1/service_va_r1c.log`，确认其中有 `stage0_action_rope = anchored` 并随结果包回传。以下评测命令都在 LIBERO 环境执行。
+   1. **R1-D 全量**（四个检查点改为 `va_libero4_r1c` 的 10k–40k，可视化用选出的检查点）：
+      ```bash
+      C=$PWD/checkpoints/APT/va_libero4_r1c
+      python -u -m examples.libero_r1.diag_r1d --va_ckpts $C/ckpt_0010000.pt $C/ckpt_0020000.pt $C/ckpt_0030000.pt $C/ckpt_0040000.pt \
+        --vis_iters $SEL_ITER --out_dir results/R1/R1D 2>&1 | tee results/R1/R1D_run.log
+      ```
+      R1-D 会热切换 VA 服务的权重，结束时服务停在 40k。**之后用 `$VA_CKPT` 重启 VA 服务**再继续。
+   2. **C 臂冒烟（冒烟 6，≥ 3/6）**：
+      ```bash
+      python -u -m examples.libero_r1.eval_r1 --arm va_oracle --suite libero_goal --task_end 2 --episodes_per_task 3 \
+        --out_root results/R1/smoke --run_name C 2>&1 | tee results/R1/smoke_C.log
+      ```
+      成功数取 `results/R1/smoke/C/libero_goal/episodes.csv` 的 `success` 之和。< 3：停止，回传该目录（含 `queries.jsonl` 和 `videos/`）。
+   3. **冒烟 9、10**：命令同 5A 第 4 步（输出目录 `results/R1/smoke/A_rep1`、`A_rep2`、`resume`）。
+   4. **C 臂全量**：4 个 suite 各 `python -u -m examples.libero_r1.eval_r1 --arm va_oracle --suite <suite>`。
+   5. **A 臂全量**：4 个 suite 各 `--arm va_random`。
+   6. **800 步附加检查**：命令同 5A 第 7 步（只需 VLA 服务）。
+   7. **汇总与打包**：
+      ```bash
+      python -m examples.libero_r1.summarize_r1
+      tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
+      ```
+      结果包顶层应有 `VA_R1C_NOTE.md`；另附 `git rev-parse HEAD`、`nvidia-smi`、两个环境的 `pip freeze`。
+
+## 5D. 诊断实验 R1-Z（规格第 13 节）（已完成）
 
 C 臂、A 臂、R1-D 继续暂停。新数据（带指令目标）是今后唯一的训练数据。**本节所有命令都在设置了新数据 YAML 的 shell 中执行**（APT 环境）：
 ```bash
@@ -128,7 +218,7 @@ python scripts/test_ckpt.py --ckpt checkpoints/hf/apt_vla/ckpt_latest.pt --train
    ```
    另附 `git rev-parse HEAD`、`nvidia-smi`。
 
-## 5E. R1-Z 追加项 Z5、Z6、P2（规格第 15 节）
+## 5E. R1-Z 追加项 Z5、Z6、P2（规格第 15 节）（已完成）
 
 5D 中已经启动的 Z1–Z4 和 P、Q **不要中断**。以下是追加项，环境与 5D 相同（APT 环境、新数据 YAML、先 `git pull`）。**拉取后再启动的任何进程都会用到新代码；新代码在 `stage0_action_rope=off`（默认）时与旧代码逐位相同，已在运行的进程不受影响。**
 
@@ -491,4 +581,11 @@ tar --exclude='*.pt' -czf R1_phase1_results.tar.gz results/R1
 2. 不运行 `context` 模式的训练；代码保留，但今后任何 VA 训练和评测一律不得使用。
 3. 冒烟 11 增加未补长对照：bf16 下 `anchored` 与 `off` 的差值应同量级（只记录）；fp32 下 `anchored` 的位置最大差 ≤ 1e-4 m，不通过即判语言泄漏（5E 第 6 步）。
 4. fp32 是推理服务的诊断模式（`remote_service --precision fp32`）：所有权重上转 fp32（冻结 VLM 原为 bf16，上转无损），VLM 注意力改用 SDPA，关闭 TF32；只作用于 `sample_trajs`，默认 bf16 行为不变。
+
+## 19. 规格第 17 节要点
+1. 根因确认：Stage-0 的未来动作 token 缺少时间顺序信息（P 对 P2：相邻步 4.89 → 0.94 cm，最优轨迹误差 6.35 → 1.07 cm）。Z5 的 VA 差 0.016 按量级判为等变。平滑后处理不采用。
+2. 今后所有 VA 用 `stage0_action_rope=anchored`；`va_libero4_r1`、`va_libero4_r1b` 停用。
+3. R1-T3：配置 `r1c_va_libero4`（= 2.1 的配置加锚定 RoPE），新数据，`apt_va` 严格加载，40000 步、每 10000 步保存，保存名 `va_libero4_r1c`。
+4. 训练后检查与选检查点见 5F 第 2–4 步（判据 1–3 由 `diag_r1z r1c_check` 计算，判据 4 为两项冒烟 11，`diag_r1z r1c_select` 汇总并按 40k → 30k 选择）。
+5. 通过后不等通知，按 5F 第 5–6 步归档旧结果并恢复第一阶段；推理服务启动日志打印 `stage0_action_rope`；结果包顶层放 `VA_R1C_NOTE.md`（本仓库 `exp/R1_va_jev_libero/results_note_r1c.md`）。
 

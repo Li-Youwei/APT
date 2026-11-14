@@ -237,3 +237,8 @@ CONFIGS["overfit_s1_goal1"] = replace(CONFIGS["overfit_s0_goal1"], train_stage=1
 # VA training or evaluation (spec 16.2); no config entry is provided for it.
 CONFIGS["overfit_s0ropeA_goal1"] = replace(CONFIGS["overfit_s0_goal1"], stage0_action_rope="anchored")
 
+# R1-T3 (spec section 17.2): the R1 VA recipe (section 2.1: 4 LIBERO suites, 2 GPUs x bs 32, 40k
+# steps, save every 10k, seed 0) with anchored Stage-0 action RoPE, trained on the commanded-target
+# data (point APT_DATA_LOC at it) from apt_va. Save name: va_libero4_r1c.
+CONFIGS["r1c_va_libero4"] = replace(CONFIGS["r1_va_libero4"], stage0_action_rope="anchored")
+

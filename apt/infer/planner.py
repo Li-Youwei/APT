@@ -48,8 +48,7 @@ def parse_config(ckpt_dir: str):
     print("[INFO] data config = {}".format(data_config))
     print("[INFO] vlm_finetune_mode = {}".format(vlm_finetune_mode))
     print("[INFO] train_stage = {}".format(train_stage))
-    if stage0_action_rope != "off":
-        print("[INFO] stage0_action_rope = {}".format(stage0_action_rope))
+    print("[INFO] stage0_action_rope = {}".format(stage0_action_rope))  # always logged (spec 17.4)
     PARSED_EXTRAS[os.path.abspath(ckpt_dir)] = dict(stage0_action_rope=stage0_action_rope)
 
     return model_name, data_config, vlm_finetune_mode, train_stage

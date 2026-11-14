@@ -338,19 +338,124 @@ def run_equivariance(args, device):
           f"VLA smallest median diff {vla_min:.3e} (> 0.1: not equivariant={vla_min > 0.1})")
 
 
+# ── 17.3 R1-T3 post-training check and checkpoint choice ─────────────────────
+
+R1C_ADJ_MAX = 0.015        # criterion 1: pooled adjacent-step median, every suite
+R1C_STEP1_MAX = 0.02       # criterion 2: step-1 error median, every suite
+R1C_ERR_MAX = 0.03         # criterion 3: best-of-8 error median, Spatial and Object only
+R1C_ERR_SUITES = ("libero_spatial", "libero_object")
+
+
+def run_r1c_check(args, device):
+    """Spec 17.3 criteria 1-3 for every --models checkpoint (Z1/Z3/Z6 metrics, 4 suites x 200
+    samples, 8 trajectories each); criterion 4 (smoke 11) is added by `r1c_select`."""
+    samples = {s: X2.build_samples(os.path.join(args.out_dir, f"samples_{s}.pt"), SUITE_CLS[s], args.n_samples)
+               for s in args.suites}
+    for s, smp in samples.items():
+        with h5py.File(smp[0]["_episode_file"], "r") as h5:
+            assert "ee_pose_desired" in h5, f"{s}: samples are not from the new (desired-pose) data; check APT_DATA_LOC"
+    res, rows = {"ground_truth": {}}, []
+    for s, smp in samples.items():
+        pooled = np.concatenate([np.linalg.norm(np.diff(gt_arrays(rec)[0], axis=0), axis=-1) for rec in smp])
+        res["ground_truth"][s] = dict(adj_median_pooled=float(np.median(pooled)), adj_p95_pooled=float(np.percentile(pooled, 95)))
+    models = [item.split("=", 1) for item in args.models] + ([["vla", args.vla]] if args.with_vla else [])
+    for label, ckpt in models:
+        model = Y.load(ckpt, device)
+        stage = model.r1_meta["train_stage"]
+        K = X2.K_VA if stage == 0 else 1
+        res[label] = dict(ckpt=ckpt, iter=model.r1_meta["current_iters"], train_stage=stage,
+                          stage0_action_rope=model.r1_meta.get("stage0_action_rope", "off"), suites={})
+        for s, smp in samples.items():
+            recs = []
+            for i, rec in enumerate(smp):
+                d = X2.batch1(rec, device)
+                ppos, pgrip = X2.predict(model, d, K, seed=i)
+                r = traj_metrics(ppos, pgrip, rec, with_clusters=(stage == 0))
+                recs.append(r)
+                rows.append(dict(suite=s, model=label, **flat_row("raw", i, r)))
+            res[label]["suites"][s] = summarize(recs)
+            m = res[label]["suites"][s]
+            print(f"[R1C] {label:<6} {s:<14} adj {cm(m['adj_median_pooled'])} cm, step1 {cm(m['err_step1_median'])} cm, "
+                  f"best err {cm(m['err_best_median'])} cm, set err {cm(m['set_err_best_median'])} cm, "
+                  f"clusters {m['n_clusters_mean']:.1f}", flush=True)
+        if stage == 0:
+            su = res[label]["suites"]
+            c1 = all(su[s]["adj_median_pooled"] <= R1C_ADJ_MAX for s in su)
+            c2 = all(su[s]["err_step1_median"] <= R1C_STEP1_MAX for s in su)
+            c3 = all(su[s]["err_best_median"] <= R1C_ERR_MAX for s in R1C_ERR_SUITES if s in su)
+            res[label]["criteria"] = dict(c1_adjacent=bool(c1), c2_step1=bool(c2), c3_err_spatial_object=bool(c3),
+                                          c1_to_c3=bool(c1 and c2 and c3 and set(R1C_ERR_SUITES) <= set(su)))
+            print(f"[R1C] {label}: criteria 1/2/3 = {c1}/{c2}/{c3}", flush=True)
+        del model
+        torch.cuda.empty_cache()
+    write_rows(os.path.join(args.out_dir, "r1c_check_rows.csv"), rows)
+    with open(os.path.join(args.out_dir, "r1c_check_summary.json"), "w") as fp:
+        json.dump(res, fp, indent=2)
+
+
+def _smoke11_passed(log_path, kind):
+    """kind 'aligned': check_sampling --smoke11 log; 'fp32': --smoke11_unpadded on an fp32 service."""
+    if not log_path or not os.path.exists(log_path):
+        return False
+    text = open(log_path, encoding="utf-8", errors="replace").read()
+    if kind == "aligned":
+        return "[SMOKE-11] overall (VA side): PASS" in text
+    return "[SMOKE-11-UNPADDED] fp32" in text and "-> PASS" in text.split("[SMOKE-11-UNPADDED] fp32", 1)[1]
+
+
+def run_r1c_select(args, device=None):
+    """Spec 17.3: 40k if it passes criteria 1-4, else 30k, else stop. --smoke11 entries are
+    label=<aligned bf16 log>,<fp32 unpadded log>."""
+    with open(args.check_json) as fp:
+        chk = json.load(fp)
+    logs = {}
+    for item in args.smoke11:
+        label, paths = item.split("=", 1)
+        a, b = (paths.split(",") + [""])[:2]
+        logs[label] = dict(aligned=_smoke11_passed(a, "aligned"), fp32=_smoke11_passed(b, "fp32"), logs=[a, b])
+    decision = {"order": args.prefer, "candidates": {}}
+    chosen = None
+    for label in args.prefer:
+        c = chk.get(label, {}).get("criteria", {})
+        sm = logs.get(label, {"aligned": False, "fp32": False, "logs": []})
+        ok = bool(c.get("c1_to_c3")) and sm["aligned"] and sm["fp32"]
+        decision["candidates"][label] = dict(criteria_1_3=c, smoke11_aligned=sm["aligned"], smoke11_fp32=sm["fp32"],
+                                             smoke11_logs=sm["logs"], passed=ok)
+        print(f"[R1C-SELECT] {label}: criteria 1-3 {c.get('c1_to_c3')}, smoke 11 aligned {sm['aligned']}, "
+              f"fp32 unpadded {sm['fp32']} -> {'PASS' if ok else 'FAIL'}")
+        if ok and chosen is None:
+            chosen = label
+    decision["selected"] = None if chosen is None else dict(label=chosen, ckpt=chk[chosen]["ckpt"], iter=chk[chosen]["iter"])
+    out_dir = os.path.dirname(os.path.abspath(args.check_json))
+    with open(os.path.join(out_dir, "r1c_selection.json"), "w") as fp:
+        json.dump(decision, fp, indent=2)
+    if chosen is None:
+        print("[R1C-SELECT] no checkpoint passes -> STOP and report")
+        raise SystemExit(1)
+    with open(os.path.join(out_dir, "selected_ckpt.txt"), "w") as fp:
+        fp.write(os.path.abspath(chk[chosen]["ckpt"]) + "\n")
+    print(f"[R1C-SELECT] use {chosen}: {chk[chosen]['ckpt']} (iter {chk[chosen]['iter']})")
+
+
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     device = "cuda:0"
+    if args.cmd == "r1c_select":
+        return run_r1c_select(args)
     {"suites": run_suites, "timesteps": run_timesteps, "overfit": run_overfit,
-     "equivariance": run_equivariance}[args.cmd](args, device)
+     "equivariance": run_equivariance, "r1c_check": run_r1c_check}[args.cmd](args, device)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["suites", "timesteps", "overfit", "equivariance"])
+    p.add_argument("cmd", choices=["suites", "timesteps", "overfit", "equivariance", "r1c_check", "r1c_select"])
     p.add_argument("--va", default="checkpoints/APT/va_libero4_r1b/ckpt_0060000.pt")
     p.add_argument("--vla", default="checkpoints/hf/apt_vla_ftlibero/ckpt_latest.pt")
-    p.add_argument("--models", nargs="*", default=[], help="overfit: label=ckpt")
+    p.add_argument("--models", nargs="*", default=[], help="overfit / r1c_check: label=ckpt")
+    p.add_argument("--with_vla", action="store_true", help="r1c_check: also record the VLA reference (Z1)")
+    p.add_argument("--check_json", default="results/R1/R1T3/check/r1c_check_summary.json", help="r1c_select")
+    p.add_argument("--smoke11", nargs="*", default=[], help="r1c_select: label=<aligned bf16 log>,<fp32 unpadded log>")
+    p.add_argument("--prefer", nargs="*", default=["va40k", "va30k"], help="r1c_select order (spec 17.3)")
     p.add_argument("--suites", nargs="+", default=list(SUITE_CLS), choices=list(SUITE_CLS))
     p.add_argument("--n_samples", type=int, default=None,
                    help="default 200 (suites, timesteps) / 100 (overfit) / 20 (equivariance)")
